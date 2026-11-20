@@ -598,12 +598,16 @@ component WindowActions inherits HorizontalLayout {
 export component AboutWindow inherits Window {
     in property <string> version;
     callback close-clicked();
+    /// The size the window opens at (read by Rust to centre it over the
+    /// main window before it is first shown).
+    out property <length> layout-preferred-width: 380px;
+    out property <length> layout-preferred-height: about-layout.preferred-height;
     title: "About Cadence";
     icon: @image-url("../../../assets/icon/icon-256.png");
     min-width: 380px;
-    preferred-width: 380px;
+    preferred-width: root.layout-preferred-width;
     background: Palette.background;
-    VerticalLayout {
+    about-layout := VerticalLayout {
         padding: 20px;
         spacing: 12px;
         alignment: start;

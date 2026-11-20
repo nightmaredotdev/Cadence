@@ -14,6 +14,7 @@ mod keys;
 mod message;
 mod overlay;
 mod picker;
+mod placement;
 mod waiter;
 
 #[cfg(any(test, feature = "diagnostics"))]
@@ -35,4 +36,5 @@ pub use keys::virtual_key;
 pub use message::show_error_message;
 pub use overlay::{OverlayStyles, set_window_opacity, window_overlay_styles};
 pub use picker::{PickOutcome, PointPicker};
+pub use placement::monitor_work_area;
 pub use waiter::HighResWaiter;

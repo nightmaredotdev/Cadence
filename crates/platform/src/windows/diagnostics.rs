@@ -549,6 +549,10 @@ pub struct WindowInfo {
     pub click_through: bool,
     /// The opacity of a layered window, if one is set (255 = opaque).
     pub alpha: Option<u8>,
+    /// The window that owns this one (owned windows stay above their owner).
+    pub owner: Option<WindowId>,
+    /// The window's rectangle in screen coordinates (frame included).
+    pub rect: Rect,
 }
 
 unsafe extern "system" fn collect_window(hwnd: HWND, data: LPARAM) -> windows_sys::core::BOOL {
@@ -561,9 +565,9 @@ unsafe extern "system" fn collect_window(hwnd: HWND, data: LPARAM) -> windows_sy
 /// Top-level windows owned by process `pid`.
 pub fn windows_of_process(pid: u32) -> Vec<WindowInfo> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GWL_EXSTYLE, GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowTextW,
-        IsWindowVisible, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, WS_EX_LAYERED,
-        WS_EX_TRANSPARENT,
+        EnumWindows, GW_OWNER, GWL_EXSTYLE, GetLayeredWindowAttributes, GetWindow,
+        GetWindowLongPtrW, GetWindowRect, GetWindowTextW, IsWindowVisible,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TRANSPARENT,
     };
     let mut handles: Vec<usize> = Vec::new();
     // SAFETY: the callback only pushes into `handles`, which outlives the call.
@@ -598,6 +602,11 @@ pub fn windows_of_process(pid: u32) -> Vec<WindowInfo> {
                 && unsafe { GetLayeredWindowAttributes(hwnd, &mut key, &mut alpha, &mut flags) }
                     != 0
                 && flags & LWA_ALPHA != 0;
+            // SAFETY: no pointer arguments; a stale handle yields null.
+            let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
+            let mut r = RECT::default();
+            // SAFETY: valid out-pointer; a stale handle leaves it empty.
+            unsafe { GetWindowRect(hwnd, &mut r) };
             Some(WindowInfo {
                 id: WindowId(h),
                 title: String::from_utf16_lossy(&buf[..len.max(0) as usize]),
@@ -605,6 +614,8 @@ pub fn windows_of_process(pid: u32) -> Vec<WindowInfo> {
                 topmost: ex_style & WS_EX_TOPMOST != 0,
                 click_through: layered && ex_style & WS_EX_TRANSPARENT != 0,
                 alpha: has_alpha.then_some(alpha),
+                owner: (!owner.is_null()).then_some(WindowId(owner as usize)),
+                rect: Rect::new(r.left, r.top, r.right, r.bottom),
             })
         })
         .collect()
@@ -747,6 +758,12 @@ pub fn bmp(width: usize, height: usize, pixels: &[[u8; 3]]) -> Vec<u8> {
         out.resize(start + row, 0);
     }
     out
+}
+
+/// The work area of the monitor `window` is on (see
+/// [`monitor_work_area`](super::monitor_work_area)).
+pub fn work_area_of(window: WindowId) -> Option<Rect> {
+    super::monitor_work_area(window.0 as isize).ok()
 }
 
 /// The client area of a window in screen coordinates.

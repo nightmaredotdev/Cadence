@@ -7,6 +7,7 @@
 //! `unsafe_code = "deny"` lint still applies everywhere else.
 
 pub mod config_store;
+pub mod dialog;
 pub mod form;
 #[cfg(windows)]
 pub mod gui;

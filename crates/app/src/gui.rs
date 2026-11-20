@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::dialog;
 use crate::form::{self, IntervalUnit, KeyInput, Status, TimingFields};
 use crate::overlay::{self, NativeState, OVERLAY_ALPHA, OverlayWindow};
 use crate::runtime::{RebindError, Runtime, ShutdownReport, WaiterKind};
@@ -29,19 +30,22 @@ use crate::{config_store, logging};
 use cadence_core::backend::InputBackend;
 use cadence_core::config::{ClickConfig, Config, HotkeyAction, TargetMode};
 use cadence_core::engine::Command;
-use cadence_core::geometry::Point;
+use cadence_core::geometry::{Point, Rect};
 use cadence_core::keys::{Hotkey, Modifiers};
 use cadence_core::status::{RunState, Snapshot};
 use cadence_platform::{
     Acquire, InstanceLock, OverlayStyles, PickOutcome, PointPicker, SystemEvents, WindowsInput,
-    acquire_instance, activate_own_window, enable_per_monitor_dpi_awareness, set_window_opacity,
-    window_overlay_styles,
+    acquire_instance, activate_own_window, enable_per_monitor_dpi_awareness, monitor_work_area,
+    set_window_opacity, window_overlay_styles,
 };
 use log::{error, info, warn};
-use slint::winit_030::WinitWindowAccessor;
+use slint::winit_030::winit::event::WindowEvent as WinitEvent;
+use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows;
 use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{
-    CloseRequestResponse, ComponentHandle, LogicalSize, ModelRc, SharedString, Timer, VecModel,
+    CloseRequestResponse, ComponentHandle, LogicalSize, ModelRc, PhysicalPosition, SharedString,
+    Timer, VecModel,
 };
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -240,6 +244,7 @@ impl App {
             .validate()
             .map_err(|e| format!("internal error: loaded settings are invalid: {e}"))?;
 
+        select_backend();
         let ui = MainWindow::new().map_err(|e| format!("could not create the window: {e}"))?;
         let weak = ui.as_weak();
         let wake = {
@@ -465,6 +470,16 @@ impl Controller {
             .toggle_overlay(OverlaySource::Window));
         on!(on_overlay_hotkey, |c| c
             .toggle_overlay(OverlaySource::Hotkey));
+
+        let weak = Rc::downgrade(this);
+        ui.window().on_winit_window_event(move |_, event| {
+            if matches!(event, WinitEvent::Moved(_) | WinitEvent::Resized(_))
+                && let Some(c) = weak.upgrade()
+            {
+                c.follow_main_window();
+            }
+            EventResult::Propagate
+        });
 
         let weak = Rc::downgrade(this);
         ui.window().on_close_requested(move || {
@@ -1049,25 +1064,60 @@ impl Controller {
         self.save();
     }
 
+    /// Shows the About window: an owned window of the main window (it stays
+    /// above it, is hidden with it when minimized and has no taskbar button
+    /// of its own), centred over it.
     fn show_about(&self) {
         self.commit_pending_edits();
-        let mut about = self.about.borrow_mut();
-        if about.is_none() {
-            let Ok(window) = AboutWindow::new() else {
-                self.show_notice("The About window could not be opened.".into());
-                return;
-            };
-            window.set_version(env!("CARGO_PKG_VERSION").into());
-            let weak = window.as_weak();
-            window.on_close_clicked(move || {
-                if let Some(w) = weak.upgrade() {
-                    let _ = w.hide();
-                }
-            });
-            *about = Some(window);
+        let Some(ui) = self.ui.upgrade() else { return };
+        let window = {
+            let mut about = self.about.borrow_mut();
+            if about.is_none() {
+                // Created while the owner is set, so the creation hook (see
+                // `select_backend`) makes it an owned window of this window.
+                DIALOG_OWNER.with(|o| o.set(NativeWindow(ui.window()).hwnd().ok()));
+                let created = AboutWindow::new();
+                DIALOG_OWNER.with(|o| o.set(None));
+                let Ok(window) = created else {
+                    drop(about);
+                    self.show_notice("The About window could not be opened.".into());
+                    return;
+                };
+                window.set_version(env!("CARGO_PKG_VERSION").into());
+                let weak = window.as_weak();
+                window.on_close_clicked(move || {
+                    if let Some(w) = weak.upgrade() {
+                        let _ = w.hide();
+                    }
+                });
+                // Its size, before it is first shown: the layout gets its
+                // width first, so wrapped text is measured at that width.
+                let width = window.get_layout_preferred_width();
+                window.window().set_size(LogicalSize::new(width, 1.0));
+                let height = window.get_layout_preferred_height();
+                window.window().set_size(LogicalSize::new(width, height));
+                *about = Some(window);
+            }
+            about.as_ref().map(ComponentHandle::clone_strong)
+        };
+        let Some(window) = window else { return };
+        center_dialog(&ui, &window);
+        let _ = window.show();
+    }
+
+    /// Keeps an open About window centred when this window moves or resizes.
+    fn follow_main_window(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if !self.window_visible.get() {
+            return;
         }
-        if let Some(window) = about.as_ref() {
-            let _ = window.show();
+        let about = self
+            .about
+            .borrow()
+            .as_ref()
+            .map(ComponentHandle::clone_strong);
+        if let Some(about) = about.filter(|a| a.window().is_visible()) {
+            center_dialog(&ui, &about);
         }
     }
 
@@ -1106,6 +1156,10 @@ impl Controller {
             self.end_capture();
         }
         self.cancel_pick();
+        // The About window belongs to this window: it goes with it.
+        if let Some(about) = self.about.borrow().as_ref() {
+            let _ = about.hide();
+        }
         self.with_ui(|ui| {
             let _ = ui.hide();
         });
@@ -1337,6 +1391,94 @@ impl Controller {
         let _ = slint::quit_event_loop();
         report
     }
+}
+
+thread_local! {
+    /// Set while the About window is created: the creation hook makes it an
+    /// owned window of this window (see [`select_backend`]).
+    static DIALOG_OWNER: Cell<Option<isize>> = const { Cell::new(None) };
+}
+
+/// Selects Slint's winit backend with a hook that creates a window as an
+/// owned window of [`DIALOG_OWNER`] while that is set: a native Win32 owner
+/// relationship, set when the window is created. Once per process; if a
+/// backend was already chosen, the About window is simply not owned.
+///
+/// Limitation: the owner is applied only when the native window is created.
+/// Slint 1.18.1 destroys and later re-creates the native window of a hidden
+/// window when its event loop stops, or on hide when the
+/// `SLINT_DESTROY_WINDOW_ON_HIDE` environment variable is set, and the
+/// re-created window gets default attributes: the About window would then
+/// be an ordinary, independent window (still working, only not owned).
+/// Cadence keeps the event loop running until it exits, so the About window
+/// is created once and stays owned. A Slint upgrade must check this again
+/// (the GUI test `about_is_an_owned_dialog_centred_over_the_window` reopens
+/// About in one running event loop and fails if the window is re-created).
+fn select_backend() {
+    static SELECTED: std::sync::Once = std::sync::Once::new();
+    SELECTED.call_once(|| {
+        let selected = slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .with_winit_window_attributes_hook(|attributes| match DIALOG_OWNER.with(Cell::get) {
+                Some(owner) => attributes.with_owner_window(owner),
+                None => attributes,
+            })
+            .select();
+        if let Err(e) = selected {
+            warn!("could not configure the window backend ({e}); dialogs are not owned windows");
+        }
+    });
+}
+
+/// Centres `about` over the main window, inside the work area of its
+/// monitor. Does nothing while the main window is minimized.
+fn center_dialog(ui: &MainWindow, about: &AboutWindow) {
+    let owner = ui.window().with_winit_window(|w| {
+        let pos = w.outer_position().ok()?;
+        let (outer, inner) = (w.outer_size(), w.inner_size());
+        if inner.width == 0 || inner.height == 0 {
+            return None; // minimized
+        }
+        Some((
+            Rect::new(
+                pos.x,
+                pos.y,
+                pos.x + outer.width as i32,
+                pos.y + outer.height as i32,
+            ),
+            (
+                outer.width as i32 - inner.width as i32,
+                outer.height as i32 - inner.height as i32,
+            ),
+        ))
+    });
+    let Some(Some((owner, frame))) = owner else {
+        return;
+    };
+    // Measured once it exists; before, its size plus the main window's frame.
+    let size = about
+        .window()
+        .with_winit_window(|w| {
+            let s = w.outer_size();
+            (s.width as i32, s.height as i32)
+        })
+        .unwrap_or_else(|| {
+            let scale = ui.window().scale_factor();
+            let inner = about
+                .window()
+                .size()
+                .to_logical(about.window().scale_factor());
+            (
+                (inner.width * scale).round() as i32 + frame.0,
+                (inner.height * scale).round() as i32 + frame.1,
+            )
+        });
+    let work = NativeWindow(ui.window())
+        .hwnd()
+        .ok()
+        .and_then(|h| monitor_work_area(h).ok());
+    let p = dialog::centered_over(owner, size, work);
+    about.window().set_position(PhysicalPosition::new(p.x, p.y));
 }
 
 enum BindError {
