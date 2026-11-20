@@ -24,6 +24,7 @@ fn main() {
 mod imp {
     use cadence::config_store;
     use cadence::gui::{App, GuiOptions};
+    use cadence::overlay::OVERLAY_ALPHA;
     use cadence::runtime::{JOIN_TIMEOUT, WaiterKind};
     use cadence::ui::RunStatus;
     use cadence_core::backend::InputBackend;
@@ -32,13 +33,16 @@ mod imp {
     use cadence_core::geometry::{Point, Rect};
     use cadence_core::keys::{Hotkey, Key, Modifiers};
     use cadence_platform::diagnostics::{
-        HookEvent, MouseHookRecorder, TestWindow, WindowInfo, WindowKind, click_unmarked,
-        click_unmarked_button, client_rect, cursor_position, force_foreground, foreground_window,
-        monitors, post_close, send_keys, window_at, windows_of_process,
+        HookEvent, MouseHookRecorder, TestWindow, WindowInfo, WindowKind, capture_screen,
+        click_unmarked, click_unmarked_button, client_rect, cursor_position, force_foreground,
+        foreground_window, is_above, monitors, move_window, post_close, send_keys, window_at,
+        windows_of_process, work_area_of,
     };
     use cadence_platform::{HotkeyService, WindowsInput};
-    use slint::{Model, Timer, TimerMode};
+    use slint::{ComponentHandle, LogicalSize, Model, Timer, TimerMode};
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
+    use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     const VK_CONTROL: u16 = 0x11;
@@ -60,6 +64,7 @@ mod imp {
     const VK_F13: u16 = 0x7C;
     const VK_F16: u16 = 0x7F;
     const VK_F17: u16 = 0x80;
+    const VK_F18: u16 = 0x81;
 
     /// Runs the Slint event loop for `duration`.
     fn pump(duration: Duration) {
@@ -241,6 +246,9 @@ mod imp {
 
         first_session(&path, &recorder);
         second_session(&path);
+        compact_and_overlay_session(&dir, &recorder);
+        overlay_needs_an_available_hotkey(&dir);
+        about_is_an_owned_dialog_with_its_own_position(&dir);
         startup_conflict_is_shown(&dir);
         obsolete_start_stop_bindings_are_migrated(&dir);
         corrupt_settings_are_reported(&dir);
@@ -905,13 +913,16 @@ mod imp {
                 .to_string()
         };
 
-        step("only the three hotkey actions are offered");
+        step("only the four hotkey actions are offered");
         let labels: Vec<String> = ui
             .get_hotkeys()
             .iter()
             .map(|r| r.label.to_string())
             .collect();
-        assert_eq!(labels, ["Toggle start/stop", "Set target", "Exit"]);
+        assert_eq!(
+            labels,
+            ["Toggle start/stop", "Set target", "Toggle overlay", "Exit"]
+        );
 
         step("record a Ctrl+Shift+letter hotkey by pressing it");
         focus(gui);
@@ -1158,11 +1169,1160 @@ mod imp {
         assert_ne!(ui.get_target_text(), "Not set");
         assert_eq!(app.snapshot().target, app.config().click.target);
         let rows = ui.get_hotkeys();
-        assert_eq!(rows.row_count(), 3);
-        assert_eq!(rows.row_data(2).unwrap().binding, "Ctrl+Shift+K", "exit");
+        assert_eq!(rows.row_count(), 4);
+        assert_eq!(rows.row_data(3).unwrap().binding, "Ctrl+Shift+K", "exit");
+        assert_eq!(rows.row_data(2).unwrap().binding, "Not set", "overlay");
         assert_eq!(rows.row_data(1).unwrap().binding, "Not set", "set target");
         assert!(app.close().unwrap().is_clean());
         drop(app);
+    }
+
+    fn hotkey_index(action: HotkeyAction) -> i32 {
+        HotkeyAction::ALL.iter().position(|a| *a == action).unwrap() as i32
+    }
+
+    /// The middle of the main window's client area.
+    fn center_of(window: cadence_platform::diagnostics::WindowId) -> Point {
+        let r = client_rect(window).expect("client area");
+        Point::new((r.left + r.right) / 2, (r.top + r.bottom) / 2)
+    }
+
+    fn size_of(r: Rect) -> (i32, i32) {
+        (r.right - r.left, r.bottom - r.top)
+    }
+
+    /// Asserts that overlay mode is active, verified natively.
+    fn assert_overlay_on(app: &App) {
+        assert!(app.overlay_active());
+        assert!(app.ui().get_overlay_active(), "the window shows it");
+        assert!(
+            app.tray().unwrap().get_overlay_active(),
+            "the tray shows it"
+        );
+        let s = app.native_overlay_styles().expect("native state");
+        assert!(s.click_through && s.layered, "{s:?}");
+        assert_eq!(s.alpha, Some(OVERLAY_ALPHA), "{s:?}");
+    }
+
+    /// Asserts that the window is back to normal, verified natively.
+    fn assert_overlay_off(app: &App) {
+        assert!(!app.overlay_active());
+        assert!(!app.ui().get_overlay_active());
+        assert!(!app.tray().unwrap().get_overlay_active());
+        let s = app.native_overlay_styles().expect("native state");
+        assert!(s.is_normal(), "{s:?}");
+    }
+
+    /// Overlay mode is off for a hidden window. Between test steps Slint may
+    /// drop a hidden window's native window (see the tray step below); a
+    /// window that does not exist cannot be click-through either.
+    fn assert_overlay_off_while_hidden(app: &App) {
+        assert!(!app.overlay_active());
+        assert!(!app.ui().get_overlay_active());
+        assert!(!app.tray().unwrap().get_overlay_active());
+        if let Ok(s) = app.native_overlay_styles() {
+            assert!(s.is_normal(), "{s:?}");
+        }
+    }
+
+    fn compact_and_overlay_session(dir: &Path, recorder: &MouseHookRecorder) {
+        let path = dir.join("overlay.toml");
+        let mut cfg = initial_config();
+        cfg.click.mode = TargetMode::Cursor;
+        cfg.hotkeys.overlay = Some(Hotkey::plain(Key::F18));
+        config_store::save(&path, &cfg).unwrap();
+
+        step("compact layout: launch in the full layout");
+        let app = App::new(options(&path)).expect("app starts");
+        let ui = app.ui();
+        let tray = app.tray().expect("notification-area icon");
+        app.show_window();
+        pump(Duration::from_millis(500));
+        let gui = main_window("Cadence").id;
+        assert!(!ui.get_compact_mode());
+        assert_eq!(ui.get_overlay_key(), "F18", "shown on the Overlay button");
+        let full = size_of(client_rect(gui).unwrap());
+        assert_overlay_off(&app);
+
+        step("compact layout: the full layout cut off below the status panel");
+        ui.invoke_compact_toggled();
+        pump_until("compact window", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()).1 < full.1 / 2
+        });
+        pump(Duration::from_millis(200));
+        let compact = size_of(client_rect(gui).unwrap());
+        assert!(ui.get_compact_mode());
+        assert_eq!(compact.0, full.0, "the full layout cut off: the same width");
+        assert_eq!(
+            compact.1 as f32,
+            (ui.get_layout_preferred_height() * ui.window().scale_factor()).round(),
+            "exactly as tall as the compact layout"
+        );
+        assert_eq!(ui.get_toggle_key(), "F13", "Start/Stop shows its hotkey");
+        assert!(saved(&path).window.compact, "the layout is saved");
+
+        step("compact layout: expanded near the bottom of the screen, on screen and drawn");
+        let start = main_window("Cadence").rect;
+        let monitor = monitors()
+            .into_iter()
+            .find(|m| {
+                (m.left..m.right).contains(&start.left) && (m.top..m.bottom).contains(&start.top)
+            })
+            .expect("the window's monitor");
+        // The lower half of the compact window below the screen's edge.
+        let low = monitor.bottom - (start.bottom - start.top) / 2;
+        ui.window()
+            .set_position(slint::PhysicalPosition::new(start.left, low));
+        pump_until("moved down", Duration::from_secs(2), || {
+            main_window("Cadence").rect.top == low
+        });
+        ui.invoke_compact_toggled();
+        pump_until("full window", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == full
+        });
+        pump(Duration::from_millis(400));
+        let grown = main_window("Cadence").rect;
+        let work = work_area_of(gui).expect("work area");
+        assert!(
+            grown.left >= work.left
+                && grown.top >= work.top
+                && grown.right <= work.right
+                && grown.bottom <= work.bottom,
+            "grown inside the work area: {grown:?} in {work:?}"
+        );
+        assert_eq!(grown.left, start.left, "moved up only");
+        assert_drawn(gui, "after growing");
+        // Moved elsewhere, as the user would: drawn everywhere.
+        ui.window()
+            .set_position(slint::PhysicalPosition::new(work.left + 40, work.top + 40));
+        pump(Duration::from_millis(400));
+        assert_drawn(gui, "after moving");
+        ui.invoke_compact_toggled();
+        pump_until("compact again", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == compact
+        });
+        ui.window()
+            .set_position(slint::PhysicalPosition::new(start.left, start.top));
+        pump_until("back where it was", Duration::from_secs(2), || {
+            main_window("Cadence").rect.top == start.top
+        });
+
+        step("compact layout: switching while clicking keeps clicking and the settings");
+        let settings = app.config();
+        recorder.clear();
+        ui.invoke_start_stop_clicked();
+        pump_until("clicks", Duration::from_secs(5), || {
+            downs(&recorder.events()) >= 3
+        });
+        let clicks = app.snapshot().run_clicks;
+        ui.invoke_compact_toggled();
+        pump_until("full window", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == full
+        });
+        assert!(!ui.get_compact_mode());
+        assert!(!saved(&path).window.compact);
+        let before = downs(&recorder.events());
+        pump(Duration::from_millis(400));
+        assert!(downs(&recorder.events()) > before, "still clicking");
+        assert_eq!(ui.get_status(), RunStatus::Running);
+        assert!(
+            app.snapshot().run_clicks > clicks,
+            "the same run continues (not restarted)"
+        );
+        assert_eq!(
+            app.config().click,
+            settings.click,
+            "click settings unchanged"
+        );
+        assert_eq!(app.config().hotkeys, settings.hotkeys, "hotkeys unchanged");
+        assert_eq!(ui.get_interval_text(), "100", "fields kept");
+        assert_eq!(ui.get_hotkeys().row_count(), 4);
+
+        step("overlay: translucent, click-through and in front; clicking goes on");
+        ui.invoke_compact_toggled();
+        pump_until("compact again", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == compact
+        });
+        assert!(!main_window("Cadence").topmost);
+        ui.invoke_overlay_clicked();
+        assert_overlay_on(&app);
+        pump_until("always on top", Duration::from_secs(2), || {
+            main_window("Cadence").topmost
+        });
+        pump(Duration::from_millis(300));
+        // Making it topmost rewrites the window styles: still an overlay.
+        assert_overlay_on(&app);
+        assert_eq!(
+            size_of(client_rect(gui).unwrap()),
+            compact,
+            "overlay mode keeps the window size"
+        );
+        let center = center_of(gui);
+        assert_ne!(
+            window_at(center),
+            gui,
+            "the mouse passes through the window"
+        );
+        assert!(!app.config().window.always_on_top, "the setting is kept");
+        let before = downs(&recorder.events());
+        pump(Duration::from_millis(400));
+        assert!(downs(&recorder.events()) > before, "still clicking");
+
+        step("overlay: the hotkey ends it while another program has the focus");
+        let m = monitors()[0];
+        let r = Rect::new(m.right - 260, m.bottom - 260, m.right - 60, m.bottom - 60);
+        let other = TestWindow::create(r, WindowKind::TopmostPopup, "overlay keys").unwrap();
+        focus(other.id());
+        press(other.id(), &tap(VK_F18));
+        pump_until("overlay off by hotkey", Duration::from_secs(3), || {
+            !app.overlay_active()
+        });
+        assert_overlay_off(&app);
+        pump_until("brought to the front", Duration::from_secs(2), || {
+            foreground_window() == gui
+        });
+        pump_until("not on top any more", Duration::from_secs(2), || {
+            !main_window("Cadence").topmost
+        });
+        assert_eq!(ui.get_status(), RunStatus::Running, "clicking goes on");
+
+        step("overlay: the hotkey turns it on without taking the focus");
+        focus(other.id());
+        press(other.id(), &tap(VK_F18));
+        pump_until("overlay on by hotkey", Duration::from_secs(3), || {
+            app.overlay_active()
+        });
+        assert_overlay_on(&app);
+        pump(Duration::from_millis(300));
+        assert_eq!(
+            foreground_window(),
+            other.id(),
+            "the program in use keeps the focus"
+        );
+
+        step("overlay: the keyboard cannot pause or clear its hotkey");
+        ui.invoke_start_recording(hotkey_index(HotkeyAction::Overlay));
+        pump(Duration::from_millis(100));
+        assert_eq!(ui.get_capturing_index(), -1, "recording refused");
+        assert!(app.hotkeys_active());
+        ui.invoke_hotkey_clear(hotkey_index(HotkeyAction::Overlay));
+        assert_eq!(app.config().hotkeys.overlay, Some(Hotkey::plain(Key::F18)));
+        assert_overlay_on(&app);
+
+        step("overlay: the tray turns it off and on");
+        tray.invoke_toggle_overlay();
+        assert_overlay_off(&app);
+        tray.invoke_toggle_overlay();
+        assert_overlay_on(&app);
+
+        step("overlay: stopping and starting clicking from the tray keeps it on");
+        tray.invoke_start_stop();
+        pump_until("stopped", Duration::from_secs(2), || {
+            ui.get_status() == RunStatus::Stopped
+        });
+        assert_overlay_on(&app);
+        recorder.clear();
+        tray.invoke_start_stop();
+        pump_until("clicking again", Duration::from_secs(5), || {
+            downs(&recorder.events()) >= 2
+        });
+        assert_overlay_on(&app);
+
+        step("overlay: closing the window ends it; the hotkey does nothing while hidden");
+        assert!(post_close(gui), "WM_CLOSE posted");
+        pump_until("hidden", Duration::from_secs(2), || !app.window_visible());
+        assert_overlay_off_while_hidden(&app);
+        focus(other.id());
+        press(other.id(), &tap(VK_F18));
+        pump(Duration::from_millis(500));
+        assert!(!app.window_visible(), "not shown by the hotkey");
+        assert_overlay_off_while_hidden(&app);
+        assert_eq!(foreground_window(), other.id(), "focus not taken");
+
+        step("overlay: the tray item shows the window; the icon ends overlay mode");
+        // In the application the hidden window keeps its native window, so
+        // the tray item turns overlay mode on at once. This test leaves the
+        // event loop between steps, and Slint then drops the native window of
+        // a hidden window, which comes back only once the loop runs again. So
+        // here the item shows the window (and reports, safely, that overlay
+        // mode could not be turned on yet); it is then turned on from the
+        // tray as usual.
+        tray.invoke_toggle_overlay();
+        pump_until("shown", Duration::from_secs(3), || {
+            app.window_visible() && app.native_overlay_styles().is_ok()
+        });
+        if !app.overlay_active() {
+            assert_overlay_off(&app);
+            tray.invoke_toggle_overlay();
+        }
+        assert_overlay_on(&app);
+        tray.invoke_show_window(); // left click on the icon
+        pump_until("normal window", Duration::from_secs(2), || {
+            !app.overlay_active()
+        });
+        assert_overlay_off(&app);
+        assert!(app.window_visible());
+        assert!(ui.get_compact_mode(), "still compact");
+        drop(other);
+
+        step("overlay: exiting while it is on shuts down cleanly");
+        ui.invoke_overlay_clicked();
+        assert_overlay_on(&app);
+        tray.invoke_exit();
+        let report = app.shutdown_report().expect("shut down");
+        assert!(report.is_clean(), "{report:?}");
+        assert!(!app.overlay_active());
+        pump(Duration::from_millis(300));
+        let count = recorder.events().len();
+        pump(Duration::from_millis(300));
+        assert_eq!(recorder.events().len(), count, "no clicks after exit");
+        assert_paired(&recorder.events());
+        drop(app);
+
+        step("compact layout: restored at the next start");
+        let app = App::new(options(&path)).expect("app restarts");
+        app.show_window();
+        pump(Duration::from_millis(500));
+        assert!(app.ui().get_compact_mode());
+        let gui = main_window("Cadence").id;
+        assert_eq!(size_of(client_rect(gui).unwrap()), compact);
+        assert_overlay_off(&app);
+
+        step("compact layout: the full layout opens at its usual size");
+        app.ui().invoke_compact_toggled();
+        pump_until("full window", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == full
+        });
+        assert!(app.close().unwrap().is_clean());
+        drop(app);
+        recorder.clear();
+    }
+
+    fn about_window() -> Option<WindowInfo> {
+        own_windows()
+            .into_iter()
+            .find(|w| w.visible && w.title == "About Cadence")
+    }
+
+    fn size_of_rect(r: Rect) -> (i32, i32) {
+        (r.right - r.left, r.bottom - r.top)
+    }
+
+    /// Where the About window opens: over `main`'s upper right, inside the
+    /// work area of its monitor.
+    fn expected_about(main: &WindowInfo, about: &WindowInfo) -> Point {
+        cadence::dialog::over_upper_right(
+            main.rect,
+            size_of_rect(about.rect),
+            work_area_of(main.id),
+        )
+    }
+
+    fn covers(a: Rect, b: Rect) -> bool {
+        a.left <= b.left && a.top <= b.top && a.right >= b.right && a.bottom >= b.bottom
+    }
+
+    /// The full layout's client area, as on screen, is drawn everywhere: its
+    /// 14 px margins (left, right and bottom) show the window's background
+    /// in every row and column. An area left undrawn shows black, stale
+    /// content or the windows behind instead. (Clear of the rounded corners.)
+    fn assert_drawn(window: cadence_platform::diagnostics::WindowId, what: &str) {
+        let r = client_rect(window).expect("client area");
+        let pixels = capture_screen(r).expect("screen capture");
+        let (width, height) = ((r.right - r.left) as usize, (r.bottom - r.top) as usize);
+        let at = |x: usize, y: usize| pixels[y * width + x];
+        let background = at(6, 6);
+        let margins = (0..height - 12)
+            .flat_map(|y| (3..11).chain(width - 11..width - 3).map(move |x| (x, y)))
+            .chain((height - 10..height - 4).flat_map(|y| (12..width - 12).map(move |x| (x, y))));
+        let undrawn: Vec<(usize, usize)> =
+            margins.filter(|&(x, y)| at(x, y) != background).collect();
+        assert!(
+            undrawn.is_empty(),
+            "{what}: {} margin pixels are not the background {background:?}, the first at {:?}",
+            undrawn.len(),
+            undrawn.first()
+        );
+    }
+
+    fn overlap(a: Rect, b: Rect) -> bool {
+        a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+    }
+
+    fn near(a: Point, b: Point, tolerance: i32) -> bool {
+        (a.x - b.x).abs() <= tolerance && (a.y - b.y).abs() <= tolerance
+    }
+
+    /// One part of a scenario run inside a single run of the event loop.
+    enum Step {
+        /// A heading, printed like the other steps.
+        Say(&'static str),
+        /// Runs once (and may assert).
+        Act(Box<dyn FnMut()>),
+        /// Polled until it holds; fails after the timeout.
+        Wait(&'static str, Duration, Box<dyn FnMut() -> bool>),
+    }
+
+    fn act(f: impl FnMut() + 'static) -> Step {
+        Step::Act(Box::new(f))
+    }
+
+    fn wait_for(what: &'static str, f: impl FnMut() -> bool + 'static) -> Step {
+        Step::Wait(what, Duration::from_secs(3), Box::new(f))
+    }
+
+    /// Lets the event loop run for `duration` (repaints, window messages).
+    fn settle(duration: Duration) -> Step {
+        let mut since: Option<Instant> = None;
+        Step::Wait(
+            "settling",
+            duration * 2,
+            Box::new(move || since.get_or_insert_with(Instant::now).elapsed() >= duration),
+        )
+    }
+
+    fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "a step panicked".into())
+    }
+
+    /// Runs `steps` in order inside one run of the event loop, as in the
+    /// application. Unlike `pump`, the loop is not stopped between steps:
+    /// stopping it lets Slint re-create the native windows of hidden windows,
+    /// which never happens while the application runs. A failed assertion
+    /// or a timeout ends the loop and fails the test with its message.
+    fn run_in_one_event_loop(steps: Vec<Step>) {
+        struct Run {
+            steps: std::vec::IntoIter<Step>,
+            current: Option<(Step, Instant)>,
+            failure: Option<String>,
+            finished: bool,
+        }
+        let run = Rc::new(RefCell::new(Run {
+            steps: steps.into_iter(),
+            current: None,
+            failure: None,
+            finished: false,
+        }));
+        let timer = Timer::default();
+        let state = run.clone();
+        timer.start(TimerMode::Repeated, Duration::from_millis(20), move || {
+            let mut run = state.borrow_mut();
+            while !run.finished {
+                if run.current.is_none() {
+                    match run.steps.next() {
+                        Some(next) => run.current = Some((next, Instant::now())),
+                        None => {
+                            run.finished = true;
+                            let _ = slint::quit_event_loop();
+                            return;
+                        }
+                    }
+                }
+                let Some((current, started)) = run.current.as_mut() else {
+                    return;
+                };
+                let started = *started;
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match current {
+                        Step::Say(name) => {
+                            step(name);
+                            Ok(true)
+                        }
+                        Step::Act(f) => {
+                            f();
+                            Ok(true)
+                        }
+                        Step::Wait(what, timeout, f) => {
+                            if f() {
+                                Ok(true)
+                            } else if started.elapsed() > *timeout {
+                                Err(format!("timed out waiting for: {what}"))
+                            } else {
+                                Ok(false)
+                            }
+                        }
+                    }));
+                match outcome {
+                    Ok(Ok(true)) => run.current = None,
+                    Ok(Ok(false)) => return, // polled again on the next tick
+                    Ok(Err(failure)) => run.failure = Some(failure),
+                    Err(panic) => run.failure = Some(panic_message(panic.as_ref())),
+                }
+                if run.failure.is_some() {
+                    run.finished = true;
+                    let _ = slint::quit_event_loop();
+                }
+            }
+        });
+        slint::run_event_loop_until_quit().expect("event loop");
+        drop(timer);
+        let mut run = run.borrow_mut();
+        if let Some(failure) = run.failure.take() {
+            panic!("{failure}");
+        }
+        assert!(
+            run.steps.next().is_none() && run.current.is_none(),
+            "the event loop ended before the scenario finished"
+        );
+    }
+
+    /// What the About scenario remembers between its steps.
+    #[derive(Default)]
+    struct AboutRun {
+        /// The native About window, from its first opening.
+        about: Option<cadence_platform::diagnostics::WindowId>,
+        /// The main window's rectangle before About was opened.
+        main: Option<Rect>,
+        /// About's own rectangle, recorded to check that it stays there.
+        about_rect: Option<Rect>,
+    }
+
+    fn record_about(state: &Rc<RefCell<AboutRun>>) -> Step {
+        let state = state.clone();
+        act(move || state.borrow_mut().about_rect = Some(about_window().unwrap().rect))
+    }
+
+    /// About is open at the position recorded by [`record_about`], however
+    /// the main window moved, resized or was hidden and shown meanwhile.
+    fn about_stayed(state: &Rc<RefCell<AboutRun>>, what: &'static str) -> Step {
+        let state = state.clone();
+        act(move || {
+            let about = about_window().expect("About open");
+            assert_eq!(
+                Some(about.rect),
+                state.borrow().about_rect,
+                "About kept its own position: {what}"
+            );
+        })
+    }
+
+    /// Moves About as the user would by dragging it, by (`dx`, `dy`), and
+    /// checks that the main window stays put.
+    fn drag_about(state: &Rc<RefCell<AboutRun>>, dx: i32, dy: i32) -> Vec<Step> {
+        let target = Rc::new(std::cell::Cell::new(Point::new(0, 0)));
+        vec![
+            record_main(state),
+            act({
+                let target = target.clone();
+                move || {
+                    let r = about_window().unwrap().rect;
+                    target.set(Point::new(r.left + dx, r.top + dy));
+                    assert!(move_window(about_window().unwrap().id, target.get()));
+                }
+            }),
+            wait_for("About moved", move || {
+                about_window().is_some_and(|a| Point::new(a.rect.left, a.rect.top) == target.get())
+            }),
+            settle(Duration::from_millis(250)),
+            act({
+                let state = state.clone();
+                move || {
+                    let expected = state.borrow().main.expect("recorded");
+                    assert_eq!(
+                        main_window("Cadence").rect,
+                        expected,
+                        "moving About does not move the main window"
+                    );
+                }
+            }),
+            record_about(state),
+        ]
+    }
+
+    fn record_main(state: &Rc<RefCell<AboutRun>>) -> Step {
+        let state = state.clone();
+        act(move || state.borrow_mut().main = Some(main_window("Cadence").rect))
+    }
+
+    /// Opens About and checks it: owned by the main window, the same native
+    /// window as at its first opening, over the main window's upper right,
+    /// leaving part of it uncovered. The first position is set before the
+    /// window exists, from its expected size, so a few pixels of frame
+    /// difference are allowed then.
+    fn open_about(app: &Rc<App>, state: &Rc<RefCell<AboutRun>>, tolerance: i32) -> Vec<Step> {
+        let (app, state) = (app.clone(), state.clone());
+        vec![
+            act(move || app.ui().invoke_about_clicked()),
+            wait_for("the About window", || about_window().is_some()),
+            settle(Duration::from_millis(250)),
+            act(move || {
+                let (main, about) = (main_window("Cadence"), about_window().unwrap());
+                assert_eq!(about.owner, Some(main.id), "owned by the main window");
+                assert!(!about.click_through, "About takes the mouse");
+                let mut state = state.borrow_mut();
+                match state.about {
+                    None => state.about = Some(about.id),
+                    Some(first) => assert_eq!(
+                        about.id, first,
+                        "the same native About window as at its first opening"
+                    ),
+                }
+                let at = Point::new(about.rect.left, about.rect.top);
+                let expected = expected_about(&main, &about);
+                assert!(
+                    near(at, expected, tolerance),
+                    "About at {at}, expected {expected}"
+                );
+                assert!(
+                    overlap(about.rect, main.rect) && !covers(about.rect, main.rect),
+                    "About opens over part of the main window: {:?} / {:?}",
+                    about.rect,
+                    main.rect
+                );
+                state.about_rect = Some(about.rect);
+            }),
+        ]
+    }
+
+    /// Closes About (as its close button does) and checks that the main
+    /// window kept the size and position it had before About was opened.
+    fn close_about(state: &Rc<RefCell<AboutRun>>) -> Vec<Step> {
+        let state = state.clone();
+        vec![
+            act(|| assert!(post_close(about_window().unwrap().id), "WM_CLOSE posted")),
+            wait_for("About closed", || about_window().is_none()),
+            act(move || {
+                let expected = state.borrow().main.expect("recorded");
+                assert_eq!(
+                    main_window("Cadence").rect,
+                    expected,
+                    "main window unchanged"
+                );
+            }),
+        ]
+    }
+
+    /// About above the main window, taking the mouse at its centre.
+    fn about_on_top(about: &WindowInfo) {
+        let r = about.rect;
+        let center = Point::new((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        assert_eq!(
+            window_at(center),
+            about.id,
+            "About is in front, under the mouse"
+        );
+    }
+
+    /// About above its owner in the Z-order and in front of it, always on
+    /// top exactly when the main window is (Windows keeps an owned window in
+    /// its owner's band), never on its own.
+    fn about_above_main(topmost: bool) {
+        let (main, about) = (main_window("Cadence"), about_window().unwrap());
+        assert_eq!(about.owner, Some(main.id), "owned by the main window");
+        assert!(is_above(about.id, main.id), "About above the main window");
+        assert_eq!(main.topmost, topmost, "the main window's level");
+        assert_eq!(about.topmost, topmost, "About on its owner's level");
+        about_on_top(&about);
+    }
+
+    fn about_is_an_owned_dialog_with_its_own_position(dir: &Path) {
+        let path = dir.join("about.toml");
+        let mut cfg = initial_config();
+        cfg.click.mode = TargetMode::Cursor;
+        cfg.hotkeys.overlay = Some(Hotkey::plain(Key::F18));
+        config_store::save(&path, &cfg).unwrap();
+        let app = Rc::new(App::new(options(&path)).expect("app starts"));
+        app.show_window();
+        let state = Rc::new(RefCell::new(AboutRun::default()));
+        let a = &app;
+        let mut steps = vec![
+            Step::Say(
+                "about (in one event loop): the first opening creates an owned window over the main window",
+            ),
+            wait_for("the main window", || {
+                own_windows()
+                    .iter()
+                    .any(|w| w.visible && w.title.starts_with("Cadence"))
+            }),
+            settle(Duration::from_millis(400)),
+            record_main(&state),
+        ];
+        steps.extend(open_about(a, &state, 4));
+        steps.push(act(|| {
+            assert!(!main_window("Cadence").topmost);
+            assert!(
+                !about_window().unwrap().topmost,
+                "not always on top on its own"
+            );
+        }));
+        steps.extend(close_about(&state));
+
+        steps.push(Step::Say(
+            "about: reopened several times, still the same owned window",
+        ));
+        for _ in 0..3 {
+            steps.extend(open_about(a, &state, 1));
+            steps.extend(close_about(&state));
+        }
+
+        steps.push(Step::Say(
+            "about: stays above the main window when it is activated; not always on top",
+        ));
+        steps.extend(open_about(a, &state, 1));
+        steps.push(act(|| {
+            assert!(
+                force_foreground(main_window("Cadence").id),
+                "the main window activated"
+            )
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| about_above_main(false)));
+
+        steps.push(Step::Say(
+            "about: another application's window covers both About and the main window",
+        ));
+        let other: Rc<RefCell<Option<TestWindow>>> = Rc::default();
+        steps.push(act({
+            let other = other.clone();
+            move || {
+                // Over both windows (About sticks out past the main window).
+                let (m, a) = (main_window("Cadence").rect, about_window().unwrap().rect);
+                let r = Rect::new(
+                    m.left.min(a.left) - 20,
+                    m.top.min(a.top) - 20,
+                    m.right.max(a.right) + 20,
+                    m.bottom.max(a.bottom) + 20,
+                );
+                let window = TestWindow::create(r, WindowKind::Normal, "unrelated").unwrap();
+                assert!(window.bring_to_foreground(), "the other window activated");
+                *other.borrow_mut() = Some(window);
+            }
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act({
+            let other = other.clone();
+            move || {
+                let id = other.borrow().as_ref().unwrap().id();
+                let (main, about) = (main_window("Cadence"), about_window().unwrap());
+                assert!(is_above(id, about.id), "the other window covers About");
+                assert!(
+                    is_above(id, main.id),
+                    "the other window covers the main window"
+                );
+                assert!(is_above(about.id, main.id), "About still above its owner");
+                let r = about.rect;
+                let center = Point::new((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+                assert_eq!(window_at(center), id, "the other window is in front");
+            }
+        }));
+        steps.push(act({
+            let other = other.clone();
+            move || {
+                drop(other.borrow_mut().take());
+                assert!(
+                    force_foreground(main_window("Cadence").id),
+                    "the main window activated again"
+                );
+            }
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| about_above_main(false)));
+
+        steps.push(Step::Say(
+            "about: above the main window while it is always on top, and after",
+        ));
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                app.ui().set_keep_on_top(true);
+                app.ui().invoke_keep_on_top_toggled(true);
+            }
+        }));
+        steps.push(wait_for("the main window always on top", || {
+            main_window("Cadence").topmost
+        }));
+        steps.push(settle(Duration::from_millis(200)));
+        steps.push(act(|| about_above_main(true)));
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                app.ui().set_keep_on_top(false);
+                app.ui().invoke_keep_on_top_toggled(false);
+            }
+        }));
+        steps.push(wait_for("the main window not always on top", || {
+            !main_window("Cadence").topmost
+        }));
+        steps.push(settle(Duration::from_millis(200)));
+        steps.push(act(|| about_above_main(false)));
+        steps.extend(close_about(&state));
+
+        steps.push(Step::Say(
+            "about: keeps its own position when the main window moves and is resized",
+        ));
+        steps.extend(open_about(a, &state, 1));
+        let moved = Rc::new(std::cell::Cell::new(0));
+        steps.push(act({
+            let (app, moved) = (app.clone(), moved.clone());
+            move || {
+                let r = main_window("Cadence").rect;
+                moved.set(r.left + 90);
+                app.ui()
+                    .window()
+                    .set_position(slint::PhysicalPosition::new(r.left + 90, r.top + 40));
+            }
+        }));
+        steps.push(wait_for("the main window moved", move || {
+            main_window("Cadence").rect.left == moved.get()
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(about_stayed(&state, "the main window moved"));
+        let wider = Rc::new(std::cell::Cell::new(0));
+        steps.push(act({
+            let (app, wider) = (app.clone(), wider.clone());
+            move || {
+                let (w, h) = size_of_rect(main_window("Cadence").rect);
+                wider.set(w);
+                let scale = app.ui().window().scale_factor();
+                app.ui().window().set_size(LogicalSize::new(
+                    (w as f32 + 60.0) / scale,
+                    (h as f32 + 40.0) / scale,
+                ));
+            }
+        }));
+        steps.push(wait_for("the main window resized", move || {
+            size_of_rect(main_window("Cadence").rect).0 > wider.get()
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(about_stayed(&state, "the main window resized"));
+        // Now overlapping the moved and widened main window: still above it.
+        steps.push(act(|| about_above_main(false)));
+
+        steps.push(Step::Say(
+            "about: moved on its own, the main window stays put; still above it",
+        ));
+        steps.extend(drag_about(&state, -160, 70));
+        steps.push(act(|| {
+            assert!(
+                force_foreground(main_window("Cadence").id),
+                "the main window activated"
+            )
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| about_above_main(false)));
+        steps.push(about_stayed(&state, "the main window activated"));
+
+        steps.push(Step::Say(
+            "about: hidden with the minimized main window, back when restored",
+        ));
+        steps.push(act({
+            let app = app.clone();
+            move || app.ui().window().set_minimized(true)
+        }));
+        steps.push(wait_for("About hidden with its owner", || {
+            about_window().is_none()
+        }));
+        steps.push(act({
+            let app = app.clone();
+            move || app.ui().window().set_minimized(false)
+        }));
+        steps.push(wait_for("About back", || about_window().is_some()));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(about_stayed(
+            &state,
+            "the main window minimized and restored",
+        ));
+        steps.push(act({
+            let state = state.clone();
+            move || {
+                let about = about_window().unwrap();
+                assert_eq!(about.owner, Some(main_window("Cadence").id));
+                assert_eq!(
+                    Some(about.id),
+                    state.borrow().about,
+                    "the same native About window"
+                );
+            }
+        }));
+        steps.push(record_main(&state));
+        steps.extend(close_about(&state));
+
+        // The compact layout has no About button: About is open there when it
+        // was opened in the full layout and the window is then made compact.
+        steps.push(Step::Say(
+            "about: switching to the compact layout with About open, several times",
+        ));
+        for _ in 0..3 {
+            steps.extend(open_about(a, &state, 1));
+            steps.push(record_about(&state));
+            steps.push(act({
+                let app = app.clone();
+                move || app.ui().invoke_compact_toggled()
+            }));
+            steps.push(wait_for("the compact window", {
+                let app = app.clone();
+                move || {
+                    app.ui().get_compact_mode() && size_of_rect(main_window("Cadence").rect).1 < 300
+                }
+            }));
+            steps.push(settle(Duration::from_millis(300)));
+            steps.push(about_stayed(&state, "the main window made compact"));
+            steps.push(act({
+                let state = state.clone();
+                move || {
+                    let about = about_window().expect("About still open");
+                    assert_eq!(about.owner, Some(main_window("Cadence").id));
+                    assert_eq!(
+                        Some(about.id),
+                        state.borrow().about,
+                        "the same About window"
+                    );
+                }
+            }));
+            steps.push(settle(Duration::from_millis(200)));
+            steps.push(record_main(&state));
+            steps.extend(close_about(&state));
+            steps.push(act({
+                let app = app.clone();
+                move || app.ui().invoke_compact_toggled()
+            }));
+            steps.push(wait_for("the full window", {
+                let app = app.clone();
+                move || {
+                    !app.ui().get_compact_mode()
+                        && size_of_rect(main_window("Cadence").rect).1 > 400
+                }
+            }));
+            steps.push(settle(Duration::from_millis(200)));
+            steps.push(record_main(&state));
+        }
+
+        // Programmatically: the compact layout has no About button.
+        steps.push(Step::Say("about: opened over the compact window"));
+        steps.push(act({
+            let app = app.clone();
+            move || app.ui().invoke_compact_toggled()
+        }));
+        steps.push(wait_for("the compact window", {
+            let app = app.clone();
+            move || app.ui().get_compact_mode() && size_of_rect(main_window("Cadence").rect).1 < 300
+        }));
+        steps.push(settle(Duration::from_millis(200)));
+        steps.push(record_main(&state));
+        steps.extend(open_about(a, &state, 1));
+        steps.push(act(|| about_above_main(false)));
+        steps.extend(close_about(&state));
+        steps.push(act({
+            let app = app.clone();
+            move || app.ui().invoke_compact_toggled()
+        }));
+        steps.push(wait_for("the full window", {
+            let app = app.clone();
+            move || {
+                !app.ui().get_compact_mode() && size_of_rect(main_window("Cadence").rect).1 > 400
+            }
+        }));
+        steps.push(settle(Duration::from_millis(200)));
+        steps.push(record_main(&state));
+
+        steps.push(Step::Say(
+            "about: usable above the overlay; closing it keeps overlay mode on",
+        ));
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                app.ui().invoke_overlay_clicked();
+                assert!(app.overlay_active(), "overlay mode before About");
+                app.ui().invoke_overlay_clicked();
+                assert!(!app.overlay_active());
+            }
+        }));
+        steps.extend(open_about(a, &state, 1));
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                app.ui().invoke_overlay_clicked();
+                assert!(app.overlay_active());
+                let styles = app.native_overlay_styles().unwrap();
+                assert!(styles.click_through, "{styles:?}");
+            }
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| {
+            let about = about_window().expect("About still open");
+            assert!(!about.click_through, "About takes the mouse");
+            assert_eq!(about.owner, Some(main_window("Cadence").id));
+            about_on_top(&about);
+        }));
+        steps.extend(close_about(&state));
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                assert!(app.overlay_active(), "still in overlay mode");
+                let styles = app.native_overlay_styles().unwrap();
+                assert!(styles.click_through && styles.alpha.is_some(), "{styles:?}");
+                app.tray().unwrap().invoke_toggle_overlay();
+                assert!(!app.overlay_active());
+                assert!(app.native_overlay_styles().unwrap().is_normal());
+                app.ui().invoke_overlay_clicked();
+                assert!(app.overlay_active(), "overlay mode after About");
+                app.ui().invoke_overlay_clicked();
+                assert!(!app.overlay_active());
+            }
+        }));
+
+        steps.push(Step::Say(
+            "about: showing the window again (tray, second start) keeps About where it is",
+        ));
+        steps.extend(open_about(a, &state, 1));
+        steps.push(record_about(&state));
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                app.ui().invoke_show_requested(); // what a second start of Cadence does
+                app.tray().unwrap().invoke_show_window(); // a click on the tray icon
+            }
+        }));
+        steps.push(settle(Duration::from_millis(400)));
+        steps.push(act(|| {
+            let about = about_window().expect("About still open");
+            assert_eq!(about.owner, Some(main_window("Cadence").id));
+            about_on_top(&about);
+        }));
+        steps.push(about_stayed(&state, "the window shown again"));
+        steps.extend(close_about(&state));
+
+        steps.push(Step::Say(
+            "about: hidden with the main window to the tray, back at its own position",
+        ));
+        steps.extend(open_about(a, &state, 1));
+        steps.extend(drag_about(&state, 40, 90));
+        steps.push(act(|| {
+            assert!(post_close(main_window("Cadence").id), "WM_CLOSE posted")
+        }));
+        steps.push(wait_for("both hidden", {
+            let app = app.clone();
+            move || !app.window_visible() && about_window().is_none()
+        }));
+        steps.push(act({
+            let app = app.clone();
+            move || app.tray().unwrap().invoke_show_window()
+        }));
+        steps.push(wait_for("the main window and About shown again", {
+            let app = app.clone();
+            move || app.window_visible() && about_window().is_some()
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(about_stayed(&state, "hidden to the tray and shown again"));
+        steps.push(act({
+            let state = state.clone();
+            move || {
+                let about = about_window().unwrap();
+                assert_eq!(about.owner, Some(main_window("Cadence").id));
+                assert_eq!(
+                    Some(about.id),
+                    state.borrow().about,
+                    "the same About window"
+                );
+                about_on_top(&about);
+            }
+        }));
+        steps.push(record_main(&state));
+        steps.extend(close_about(&state));
+        // Closed by the user: it stays closed when the main window moves and
+        // when it comes back from the tray.
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                let r = main_window("Cadence").rect;
+                app.ui()
+                    .window()
+                    .set_position(slint::PhysicalPosition::new(r.left - 50, r.top + 30));
+            }
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| {
+            assert!(
+                about_window().is_none(),
+                "a closed About stays closed when the main window moves"
+            )
+        }));
+        steps.push(act(|| {
+            assert!(post_close(main_window("Cadence").id), "WM_CLOSE posted")
+        }));
+        steps.push(wait_for("hidden", {
+            let app = app.clone();
+            move || !app.window_visible()
+        }));
+        steps.push(act({
+            let app = app.clone();
+            move || app.tray().unwrap().invoke_show_window()
+        }));
+        steps.push(wait_for("shown", {
+            let app = app.clone();
+            move || app.window_visible()
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| {
+            assert!(about_window().is_none(), "a closed About stays closed")
+        }));
+        steps.push(record_main(&state));
+        steps.extend(open_about(a, &state, 1));
+
+        steps.push(Step::Say(
+            "about: exiting with About open shuts down cleanly",
+        ));
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                app.tray().unwrap().invoke_exit();
+                let report = app.shutdown_report().expect("shut down");
+                assert!(report.is_clean(), "{report:?}");
+            }
+        }));
+        run_in_one_event_loop(steps);
+        assert!(about_window().is_none() && !app.window_visible());
+        drop(app);
+    }
+
+    fn overlay_needs_an_available_hotkey(dir: &Path) {
+        step("overlay: refused without an overlay hotkey");
+        let path = dir.join("no-overlay-key.toml");
+        config_store::save(&path, &initial_config()).unwrap();
+        let app = App::new(options(&path)).expect("app starts");
+        app.show_window();
+        pump(Duration::from_millis(300));
+        assert_eq!(app.config().hotkeys.overlay, None);
+        assert_eq!(app.ui().get_overlay_key(), "");
+        app.ui().invoke_overlay_clicked();
+        assert_overlay_off(&app);
+        assert!(
+            app.ui()
+                .get_notice_text()
+                .contains("Set one on the Hotkeys tab"),
+            "{}",
+            app.ui().get_notice_text()
+        );
+        app.tray().unwrap().invoke_toggle_overlay();
+        assert_overlay_off(&app);
+        assert!(app.close().unwrap().is_clean());
+        drop(app);
+
+        step("overlay: refused while another program holds its hotkey");
+        let path = dir.join("taken-overlay-key.toml");
+        let mut cfg = initial_config();
+        cfg.hotkeys.overlay = Some(Hotkey::plain(Key::F18));
+        config_store::save(&path, &cfg).unwrap();
+        let other = hold_hotkey(Key::F18);
+        let app = App::new(options(&path)).expect("app starts");
+        app.show_window();
+        pump(Duration::from_millis(300));
+        let row = app
+            .ui()
+            .get_hotkeys()
+            .row_data(hotkey_index(HotkeyAction::Overlay) as usize)
+            .unwrap();
+        assert!(row.problem.contains("another program"), "{}", row.problem);
+        app.ui().invoke_overlay_clicked();
+        assert_overlay_off(&app);
+        let notice = app.ui().get_notice_text().to_string();
+        assert!(notice.contains("another program uses F18"), "{notice}");
+        assert!(app.close().unwrap().is_clean());
+        assert_eq!(other.shutdown(JOIN_TIMEOUT), ThreadExit::Clean);
     }
 
     fn startup_conflict_is_shown(dir: &Path) {
@@ -1205,7 +2365,7 @@ mod imp {
         assert!(warning.contains("no longer supported"), "{warning}");
         assert_eq!(app.config().click.interval_ms, 333, "other settings kept");
         assert_eq!(app.config().hotkeys.toggle, Some(Hotkey::plain(Key::F13)));
-        assert_eq!(app.ui().get_hotkeys().row_count(), 3);
+        assert_eq!(app.ui().get_hotkeys().row_count(), 4);
         let migrated = std::fs::read_to_string(&path).unwrap();
         assert!(
             !migrated.contains("start =") && !migrated.contains("stop ="),

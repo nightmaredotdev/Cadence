@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GRAY_BRUSH, GetStockObject, HDC, HMONITOR,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -329,6 +331,9 @@ fn register_class() -> &'static [u16] {
             // SAFETY: null module name returns this executable's handle.
             hInstance: unsafe { GetModuleHandleW(std::ptr::null()) },
             lpszClassName: name.as_ptr(),
+            // A known, solid colour ([`TEST_WINDOW_GRAY`]) for screen captures.
+            // SAFETY: stock objects need no preconditions and are never freed.
+            hbrBackground: unsafe { GetStockObject(GRAY_BRUSH) },
             ..Default::default()
         };
         // SAFETY: `wc` is fully initialized and `name` lives for the program
@@ -337,6 +342,9 @@ fn register_class() -> &'static [u16] {
         name
     })
 }
+
+/// The colour every [`TestWindow`] is filled with (the stock gray brush).
+pub const TEST_WINDOW_GRAY: [u8; 3] = [128, 128, 128];
 
 /// How a [`TestWindow`] is shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -529,6 +537,49 @@ pub fn window_at(p: Point) -> WindowId {
     WindowId(hwnd as usize)
 }
 
+/// Moves `window` so its top-left corner (frame included) is at `p`, keeping
+/// its size, Z-order and activation: as when the user drags it.
+pub fn move_window(window: WindowId, p: Point) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    };
+    // SAFETY: SetWindowPos validates the handle; a stale one just fails.
+    unsafe {
+        SetWindowPos(
+            window.0 as HWND,
+            std::ptr::null_mut(),
+            p.x,
+            p.y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        ) != 0
+    }
+}
+
+/// Whether top-level window `upper` is above `lower` in the Z-order (false
+/// if either is not a top-level window or they are the same window).
+pub fn is_above(upper: WindowId, lower: WindowId) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDNEXT, GetWindow};
+    if upper == lower || upper.0 == 0 || lower.0 == 0 {
+        return false;
+    }
+    let mut hwnd = upper.0 as HWND;
+    // Bounded, in case the Z-order changes while it is walked.
+    for _ in 0..100_000 {
+        // SAFETY: GetWindow validates the handle; it returns null at the
+        // bottom of the Z-order or for a stale handle.
+        hwnd = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
+        if hwnd.is_null() {
+            return false;
+        }
+        if hwnd as usize == lower.0 {
+            return true;
+        }
+    }
+    false
+}
+
 /// A top-level window, as seen from outside its process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowInfo {
@@ -537,6 +588,14 @@ pub struct WindowInfo {
     pub visible: bool,
     /// `WS_EX_TOPMOST` is set (always on top).
     pub topmost: bool,
+    /// `WS_EX_LAYERED | WS_EX_TRANSPARENT`: mouse input passes through.
+    pub click_through: bool,
+    /// The opacity of a layered window, if one is set (255 = opaque).
+    pub alpha: Option<u8>,
+    /// The window that owns this one (owned windows stay above their owner).
+    pub owner: Option<WindowId>,
+    /// The window's rectangle in screen coordinates (frame included).
+    pub rect: Rect,
 }
 
 unsafe extern "system" fn collect_window(hwnd: HWND, data: LPARAM) -> windows_sys::core::BOOL {
@@ -549,7 +608,9 @@ unsafe extern "system" fn collect_window(hwnd: HWND, data: LPARAM) -> windows_sy
 /// Top-level windows owned by process `pid`.
 pub fn windows_of_process(pid: u32) -> Vec<WindowInfo> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowTextW, IsWindowVisible,
+        EnumWindows, GW_OWNER, GWL_EXSTYLE, GetLayeredWindowAttributes, GetWindow,
+        GetWindowLongPtrW, GetWindowRect, GetWindowTextW, IsWindowVisible,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TRANSPARENT,
     };
     let mut handles: Vec<usize> = Vec::new();
     // SAFETY: the callback only pushes into `handles`, which outlives the call.
@@ -576,11 +637,28 @@ pub fn windows_of_process(pid: u32) -> Vec<WindowInfo> {
             let visible = unsafe { IsWindowVisible(hwnd) } != 0;
             // SAFETY: no pointer arguments.
             let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+            let layered = ex_style & WS_EX_LAYERED != 0;
+            let (mut key, mut alpha, mut flags) =
+                (0u32, 0u8, LAYERED_WINDOW_ATTRIBUTES_FLAGS::default());
+            // SAFETY: valid out-pointers; fails harmlessly for other windows.
+            let has_alpha = layered
+                && unsafe { GetLayeredWindowAttributes(hwnd, &mut key, &mut alpha, &mut flags) }
+                    != 0
+                && flags & LWA_ALPHA != 0;
+            // SAFETY: no pointer arguments; a stale handle yields null.
+            let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
+            let mut r = RECT::default();
+            // SAFETY: valid out-pointer; a stale handle leaves it empty.
+            unsafe { GetWindowRect(hwnd, &mut r) };
             Some(WindowInfo {
                 id: WindowId(h),
                 title: String::from_utf16_lossy(&buf[..len.max(0) as usize]),
                 visible,
                 topmost: ex_style & WS_EX_TOPMOST != 0,
+                click_through: layered && ex_style & WS_EX_TRANSPARENT != 0,
+                alpha: has_alpha.then_some(alpha),
+                owner: (!owner.is_null()).then_some(WindowId(owner as usize)),
+                rect: Rect::new(r.left, r.top, r.right, r.bottom),
             })
         })
         .collect()
@@ -625,6 +703,110 @@ pub fn simulate_session_end(window: WindowId, timeout: Duration) -> Option<isize
         )
     };
     (ok != 0).then_some(reply as isize)
+}
+
+/// The screen's pixels in `rect` (as Windows composes them, including
+/// layered windows), row by row, as RGB. `None` if the capture failed.
+pub fn capture_screen(rect: Rect) -> Option<Vec<[u8; 3]>> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
+        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC,
+        SRCCOPY, SelectObject,
+    };
+    let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    // SAFETY: a null window gives the screen's device context.
+    let screen = unsafe { GetDC(std::ptr::null_mut()) };
+    // SAFETY: `screen` is a valid device context.
+    let memory = unsafe { CreateCompatibleDC(screen) };
+    // SAFETY: `screen` is a valid device context; positive size.
+    let bitmap = unsafe { CreateCompatibleBitmap(screen, width, height) };
+    // SAFETY: valid memory DC and bitmap (a null bitmap is rejected).
+    let previous = unsafe { SelectObject(memory, bitmap) };
+    // SAFETY: valid source and destination DCs; the copy stays inside both.
+    let copied = unsafe {
+        BitBlt(
+            memory,
+            0,
+            0,
+            width,
+            height,
+            screen,
+            rect.left,
+            rect.top,
+            SRCCOPY | CAPTUREBLT,
+        )
+    } != 0;
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height, // top-down rows
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bgra = vec![0u8; width as usize * height as usize * 4];
+    // SAFETY: restores the DC's original bitmap (GetDIBits needs the bitmap
+    // not to be selected into any DC).
+    unsafe { SelectObject(memory, previous) };
+    // SAFETY: valid DC and unselected bitmap; the buffer holds `height` rows
+    // of 32-bit pixels, as described by `info`.
+    let rows = unsafe {
+        GetDIBits(
+            memory,
+            bitmap,
+            0,
+            height as u32,
+            bgra.as_mut_ptr().cast(),
+            &mut info,
+            DIB_RGB_COLORS,
+        )
+    };
+    // SAFETY: the bitmap is not selected into any DC.
+    unsafe { DeleteObject(bitmap) };
+    // SAFETY: created above and no longer used.
+    unsafe { DeleteDC(memory) };
+    // SAFETY: obtained with GetDC above.
+    unsafe { ReleaseDC(std::ptr::null_mut(), screen) };
+    (copied && rows == height).then(|| bgra.chunks_exact(4).map(|p| [p[2], p[1], p[0]]).collect())
+}
+
+/// An uncompressed 24-bit BMP file of RGB `pixels` (row by row, top down),
+/// for looking at captures and renderings.
+pub fn bmp(width: usize, height: usize, pixels: &[[u8; 3]]) -> Vec<u8> {
+    let row = (width * 3).div_ceil(4) * 4;
+    let size = 54 + row * height;
+    let le32 = |v: usize| (v as u32).to_le_bytes();
+    let mut out = Vec::with_capacity(size);
+    out.extend(b"BM");
+    out.extend(le32(size));
+    out.extend([0; 4]);
+    out.extend(le32(54));
+    out.extend(le32(40));
+    out.extend(le32(width));
+    out.extend(le32(height));
+    out.extend([1, 0, 24, 0]);
+    out.extend([0; 24]);
+    for y in (0..height).rev() {
+        let start = out.len();
+        for p in &pixels[y * width..(y + 1) * width] {
+            out.extend([p[2], p[1], p[0]]);
+        }
+        out.resize(start + row, 0);
+    }
+    out
+}
+
+/// The work area of the monitor `window` is on (see
+/// [`monitor_work_area`](super::monitor_work_area)).
+pub fn work_area_of(window: WindowId) -> Option<Rect> {
+    super::monitor_work_area(window.0 as isize).ok()
 }
 
 /// The client area of a window in screen coordinates.

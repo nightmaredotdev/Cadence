@@ -277,6 +277,7 @@ pub fn action_label(action: HotkeyAction) -> &'static str {
     match action {
         HotkeyAction::Toggle => "Toggle start/stop",
         HotkeyAction::SetTarget => "Set target",
+        HotkeyAction::Overlay => "Toggle overlay",
         HotkeyAction::Exit => "Exit",
     }
 }
@@ -338,6 +339,15 @@ mod tests {
     use cadence_core::config::TargetMode;
     use cadence_core::geometry::Point;
     use cadence_core::status::Fault;
+
+    #[test]
+    fn every_hotkey_action_has_a_label() {
+        let labels: Vec<_> = HotkeyAction::ALL.iter().map(|&a| action_label(a)).collect();
+        assert_eq!(
+            labels,
+            ["Toggle start/stop", "Set target", "Toggle overlay", "Exit"]
+        );
+    }
 
     fn fields(i: &str, j: &str, h: &str, r: &str) -> TimingFields {
         TimingFields {

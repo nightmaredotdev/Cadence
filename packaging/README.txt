@@ -19,18 +19,34 @@ Getting started
 Default hotkeys (global, they work while other programs are focused):
   F6              Toggle start/stop clicking
   F7              Set the target to the current cursor position
+  F9              Toggle overlay mode (see below)
   Ctrl+Shift+F8   Exit
 
 While Cadence runs, Windows does not pass these key combinations to the
 focused program. All hotkeys can be changed on the Hotkeys tab.
 
+Compact view and overlay mode
+-----------------------------
+"Compact" (next to the tabs) shrinks the window to the status, the
+Start/Stop button and a line saying where and how often Cadence clicks.
+"Full view" brings back the full window. Clicking and settings are not
+affected, and the choice is kept for the next start.
+
+"Overlay" makes the window translucent and lets mouse clicks pass through
+it to the program underneath, while Cadence stays in front and keeps
+clicking. Press the overlay hotkey (F9) to turn it off again; the tray menu
+("Turn off overlay"), a click on the tray icon and closing the window also
+end it. Overlay mode needs a working overlay hotkey, so it stays off while
+none is set or another program uses it. It is never kept for the next
+start.
+
 Notification area
 -----------------
 Closing the window hides it; Cadence keeps running (and keeps clicking
 if it was clicking) in the notification area. Use the tray icon to show the
-window, start or stop clicking, open the log folder, or exit. The icon shows
-a green dot while clicking. "Exit" (tray, window or hotkey) stops clicking,
-releases the mouse button and quits.
+window, start or stop clicking, turn overlay mode on or off, open the log
+folder, or exit. The icon shows a green dot while clicking. "Exit" (tray,
+window or hotkey) stops clicking, releases the mouse button and quits.
 
 On Windows 10 a new notification-area icon may start in the overflow area
 (the ^ arrow next to the clock). Drag it onto the taskbar to keep it visible.

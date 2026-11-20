@@ -23,6 +23,12 @@ directories = "6.0"
 
 # Software renderer only: default features are disabled so femtovg (OpenGL) is not compiled.
 # CI verifies that no femtovg/Skia/Qt renderer crates end up in the dependency graph.
+# `unstable-winit-030` gives access to the native window (overlay mode makes it
+# click-through through winit; the About window is created as an owned window
+# of the main window). It adds no crates, and the exact version pin keeps this
+# unstable API from changing underneath. When upgrading Slint, re-check that a
+# hidden window keeps its native window while the event loop runs (see
+# `select_backend` in crates/app/src/gui.rs) by running the GUI test.
 slint = { version = "=1.18.1", default-features = false, features = [
     "std",
     "compat-1-2",
@@ -30,6 +36,7 @@ slint = { version = "=1.18.1", default-features = false, features = [
     "renderer-software",
     "accessibility",
     "system-tray",
+    "unstable-winit-030",
 ] }
 
 slint-build = "=1.18.1"

@@ -12,25 +12,40 @@
 //! could be created). Every exit path - tray Exit, the Exit button, the exit
 //! hotkey and the end of the Windows session - uses one shutdown
 //! ([`Controller::close`]) that runs once.
+//!
+//! Layout and overlay mode are independent. The compact layout only changes
+//! what the window shows (and its size). Overlay mode (see [`overlay`]) makes
+//! the window translucent and click-through; it ends with its hotkey, the
+//! tray, the tray icon, hiding or closing the window, starting Cadence again
+//! and exiting. Neither touches the engine, so clicking goes on unchanged.
 
 #![forbid(unsafe_code)]
 
+use crate::dialog;
 use crate::form::{self, IntervalUnit, KeyInput, Status, TimingFields};
+use crate::overlay::{self, NativeState, OVERLAY_ALPHA, OverlayWindow};
 use crate::runtime::{RebindError, Runtime, ShutdownReport, WaiterKind};
 use crate::ui::{AboutWindow, AppTray, HotkeyRow, MainWindow, RunStatus};
 use crate::{config_store, logging};
 use cadence_core::backend::InputBackend;
 use cadence_core::config::{ClickConfig, Config, HotkeyAction, TargetMode};
 use cadence_core::engine::Command;
-use cadence_core::geometry::Point;
+use cadence_core::geometry::{Point, Rect};
 use cadence_core::keys::{Hotkey, Modifiers};
 use cadence_core::status::{RunState, Snapshot};
 use cadence_platform::{
-    Acquire, InstanceLock, PickOutcome, PointPicker, SystemEvents, WindowsInput, acquire_instance,
-    activate_own_window, enable_per_monitor_dpi_awareness,
+    Acquire, InstanceLock, OverlayStyles, PickOutcome, PointPicker, SystemEvents, WindowsInput,
+    acquire_instance, activate_own_window, enable_per_monitor_dpi_awareness, monitor_work_area,
+    set_window_opacity, window_overlay_styles,
 };
 use log::{error, info, warn};
-use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, Timer, VecModel};
+use slint::winit_030::WinitWindowAccessor;
+use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows;
+use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use slint::{
+    CloseRequestResponse, ComponentHandle, LogicalSize, ModelRc, PhysicalPosition, SharedString,
+    Timer, VecModel,
+};
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -104,12 +119,72 @@ struct Controller {
     /// the window then exits instead of hiding.
     tray: Option<AppTray>,
     window_visible: Cell<bool>,
+    /// Overlay mode is on: the window was verified to be click-through.
+    overlay_active: Cell<bool>,
+    /// The window size of the full layout, given back when the compact
+    /// layout is left.
+    full_size: Cell<Option<LogicalSize>>,
+    /// The window is being widened for the full layout; its height is fitted
+    /// once it has the new width (see [`Controller::toggle_compact`]).
+    fit_height: Cell<bool>,
+    /// The About window was open when this window was hidden to the tray: it
+    /// comes back with it.
+    about_hidden_with_window: Cell<bool>,
     log_dir: Option<PathBuf>,
     shutdown_signal: ShutdownSignal,
 }
 
 /// Receives the outcome of one pick from the picker thread.
 type PickSlot = Arc<Mutex<Option<PickOutcome>>>;
+
+/// Where a request to switch overlay mode came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverlaySource {
+    Window,
+    Hotkey,
+    Tray,
+}
+
+/// The main window's native side, for overlay mode. Click-through is
+/// switched through winit, which owns the window styles and rewrites them
+/// from its own state (on show, hide, always on top, ...); the opacity and
+/// the read-back go through the platform crate.
+struct NativeWindow<'a>(&'a slint::Window);
+
+const NO_NATIVE_WINDOW: &str = "the window has not been created";
+
+impl NativeWindow<'_> {
+    fn hwnd(&self) -> Result<isize, String> {
+        self.0
+            .with_winit_window(|w| match w.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(h)) => Ok(h.hwnd.get()),
+                Ok(_) => Err("not a Win32 window".to_string()),
+                Err(e) => Err(format!("no window handle: {e}")),
+            })
+            .unwrap_or_else(|| Err(NO_NATIVE_WINDOW.into()))
+    }
+}
+
+impl OverlayWindow for NativeWindow<'_> {
+    fn set_click_through(&self, on: bool) -> Result<(), String> {
+        self.0
+            .with_winit_window(|w| w.set_cursor_hittest(!on).map_err(|e| e.to_string()))
+            .unwrap_or_else(|| Err(NO_NATIVE_WINDOW.into()))
+    }
+
+    fn set_opacity(&self, alpha: u8) -> Result<(), String> {
+        set_window_opacity(self.hwnd()?, alpha).map_err(|e| e.to_string())
+    }
+
+    fn state(&self) -> Result<NativeState, String> {
+        let s = window_overlay_styles(self.hwnd()?).map_err(|e| e.to_string())?;
+        Ok(NativeState {
+            click_through: s.click_through,
+            alpha: s.alpha,
+            layered: s.layered,
+        })
+    }
+}
 
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
@@ -171,6 +246,7 @@ impl App {
             .validate()
             .map_err(|e| format!("internal error: loaded settings are invalid: {e}"))?;
 
+        select_backend();
         let ui = MainWindow::new().map_err(|e| format!("could not create the window: {e}"))?;
         let weak = ui.as_weak();
         let wake = {
@@ -179,13 +255,18 @@ impl App {
                 let _ = weak.upgrade_in_event_loop(|ui| ui.invoke_status_ready());
             })
         };
-        let on_exit = {
+        let on_ui_hotkey = {
             let weak = weak.clone();
-            Arc::new(move || {
-                let _ = weak.upgrade_in_event_loop(|ui| ui.invoke_exit_requested());
+            Arc::new(move |action: HotkeyAction| {
+                let _ = weak.upgrade_in_event_loop(move |ui| match action {
+                    HotkeyAction::Exit => ui.invoke_exit_requested(),
+                    HotkeyAction::Overlay => ui.invoke_overlay_hotkey(),
+                    // Handled by the engine; never sent here.
+                    HotkeyAction::Toggle | HotkeyAction::SetTarget => {}
+                });
             })
         };
-        let runtime = Runtime::start(&validated, options.waiter, wake, on_exit)
+        let runtime = Runtime::start(&validated, options.waiter, wake, on_ui_hotkey)
             .map_err(|e| format!("could not start: {e}"))?;
         if let Some(e) = runtime.timer_fallback() {
             warnings.push(format!(
@@ -230,6 +311,10 @@ impl App {
             closed: Cell::new(false),
             tray,
             window_visible: Cell::new(false),
+            overlay_active: Cell::new(false),
+            full_size: Cell::new(None),
+            fit_height: Cell::new(false),
+            about_hidden_with_window: Cell::new(false),
             log_dir: options.log_dir,
             shutdown_signal: Arc::new((Mutex::new(false), Condvar::new())),
         });
@@ -281,6 +366,19 @@ impl App {
         self.ctrl.window_visible.get()
     }
 
+    /// Whether overlay mode is active (the window was verified to be
+    /// click-through and translucent).
+    pub fn overlay_active(&self) -> bool {
+        self.ctrl.overlay_active.get()
+    }
+
+    /// The overlay-related native state of the main window, read from
+    /// Windows (fails before the window exists).
+    pub fn native_overlay_styles(&self) -> Result<OverlayStyles, String> {
+        let hwnd = NativeWindow(self.ui.window()).hwnd()?;
+        window_overlay_styles(hwnd).map_err(|e| e.to_string())
+    }
+
     /// Shows the main window and brings it to the front.
     pub fn show_window(&self) {
         self.ctrl.show_window();
@@ -306,6 +404,8 @@ impl Controller {
         let config = self.config.borrow();
         ui.set_fixed_mode(config.click.mode == TargetMode::Fixed);
         ui.set_keep_on_top(config.window.always_on_top);
+        // Before the window is first shown, so it opens at this layout's size.
+        ui.set_compact_mode(config.window.compact);
         self.set_fields(
             ui,
             &TimingFields::from_config(&config.click, self.interval_unit.get()),
@@ -367,6 +467,12 @@ impl Controller {
             c.close();
         });
         on!(on_show_requested, |c| c.show_window());
+        on!(on_compact_toggled, |c| c.toggle_compact());
+        on!(on_width_changed, |c| c.fit_height_to_layout());
+        on!(on_overlay_clicked, |c| c
+            .toggle_overlay(OverlaySource::Window));
+        on!(on_overlay_hotkey, |c| c
+            .toggle_overlay(OverlaySource::Hotkey));
 
         let weak = Rc::downgrade(this);
         ui.window().on_close_requested(move || {
@@ -400,6 +506,7 @@ impl Controller {
                 }
             });
             tray_on!(on_start_stop, |c| c.start_stop());
+            tray_on!(on_toggle_overlay, |c| c.toggle_overlay(OverlaySource::Tray));
             tray_on!(on_open_logs, |c| c.open_logs());
             tray_on!(on_exit, |c| {
                 c.close();
@@ -777,18 +884,23 @@ impl Controller {
             })
             .collect();
         ui.set_hotkeys(ModelRc::new(VecModel::from(rows)));
-        ui.set_toggle_key(
-            config
-                .hotkeys
-                .toggle
-                .map(|h| h.to_string())
-                .unwrap_or_default()
-                .into(),
-        );
+        let key = |hotkey: Option<Hotkey>| hotkey.map(|h| h.to_string()).unwrap_or_default();
+        ui.set_toggle_key(key(config.hotkeys.toggle).into());
+        ui.set_overlay_key(key(config.hotkeys.overlay).into());
     }
 
     fn hotkey_record(&self, index: i32) {
         self.commit_pending_edits();
+        if self.overlay_active.get() {
+            // Only reachable with the keyboard (the window ignores the
+            // mouse). Recording pauses every hotkey, including the one that
+            // ends overlay mode, so it is refused.
+            self.with_ui(|ui| {
+                ui.set_capturing_index(-1);
+                ui.invoke_release_field_focus();
+            });
+            return;
+        }
         let Some(&action) = usize::try_from(index)
             .ok()
             .and_then(|i| HotkeyAction::ALL.get(i))
@@ -857,6 +969,10 @@ impl Controller {
 
     fn hotkey_clear(&self, index: i32) {
         self.commit_pending_edits();
+        if self.overlay_active.get() {
+            // As for recording: never unbind the way back while it is needed.
+            return;
+        }
         let Some(&action) = usize::try_from(index)
             .ok()
             .and_then(|i| HotkeyAction::ALL.get(i))
@@ -932,31 +1048,62 @@ impl Controller {
         self.save();
     }
 
+    /// Shows the About window: an owned window of the main window (it stays
+    /// above it, is hidden with it when minimized and has no taskbar button
+    /// of its own) with a position of its own. Each opening places it over
+    /// the main window's upper right (see [`place_dialog`]); after that it
+    /// stays where it is (or where the user moves it) whatever the main
+    /// window does.
     fn show_about(&self) {
         self.commit_pending_edits();
-        let mut about = self.about.borrow_mut();
-        if about.is_none() {
-            let Ok(window) = AboutWindow::new() else {
-                self.show_notice("The About window could not be opened.".into());
-                return;
-            };
-            window.set_version(env!("CARGO_PKG_VERSION").into());
-            let weak = window.as_weak();
-            window.on_close_clicked(move || {
-                if let Some(w) = weak.upgrade() {
-                    let _ = w.hide();
-                }
-            });
-            *about = Some(window);
+        let Some(ui) = self.ui.upgrade() else { return };
+        let window = {
+            let mut about = self.about.borrow_mut();
+            if about.is_none() {
+                // Created while the owner is set, so the creation hook (see
+                // `select_backend`) makes it an owned window of this window.
+                DIALOG_OWNER.with(|o| o.set(NativeWindow(ui.window()).hwnd().ok()));
+                let created = AboutWindow::new();
+                DIALOG_OWNER.with(|o| o.set(None));
+                let Ok(window) = created else {
+                    drop(about);
+                    self.show_notice("The About window could not be opened.".into());
+                    return;
+                };
+                window.set_version(env!("CARGO_PKG_VERSION").into());
+                let weak = window.as_weak();
+                window.on_close_clicked(move || {
+                    if let Some(w) = weak.upgrade() {
+                        let _ = w.hide();
+                    }
+                });
+                // Its size, before it is first shown: the layout gets its
+                // width first, so wrapped text is measured at that width.
+                let width = window.get_layout_preferred_width();
+                window.window().set_size(LogicalSize::new(width, 1.0));
+                let height = window.get_layout_preferred_height();
+                window.window().set_size(LogicalSize::new(width, height));
+                *about = Some(window);
+            }
+            about.as_ref().map(ComponentHandle::clone_strong)
+        };
+        let Some(window) = window else { return };
+        // Already open: it keeps its position.
+        if !window.window().is_visible() {
+            place_dialog(&ui, &window);
         }
-        if let Some(window) = about.as_ref() {
-            let _ = window.show();
-        }
+        let _ = window.show();
     }
 
+    /// Shows the window and brings it to the front (tray, tray icon, another
+    /// start of Cadence). Asking for the window means wanting to use it, so
+    /// this also ends overlay mode.
     fn show_window(&self) {
         if self.closed.get() {
             return;
+        }
+        if self.overlay_active.get() {
+            self.leave_overlay();
         }
         let Some(ui) = self.ui.upgrade() else { return };
         self.render_status(&ui);
@@ -969,16 +1116,41 @@ impl Controller {
             tray.set_window_visible(true);
         }
         activate_own_window(form::APP_NAME);
+        // An About window hidden with this window comes back with it, where
+        // it was (showing a window again does not move it).
+        if self.about_hidden_with_window.take() {
+            let about = self
+                .about
+                .borrow()
+                .as_ref()
+                .map(ComponentHandle::clone_strong);
+            if let Some(about) = about {
+                let _ = about.show();
+            }
+        }
     }
 
     /// Hides the window to the notification area. Clicking, hotkeys and the
-    /// tray keep working.
+    /// tray keep working. Overlay mode ends: a window shown again always
+    /// takes the mouse.
     fn hide_window(&self) {
         self.commit_pending_edits();
+        if self.overlay_active.get() {
+            self.leave_overlay();
+        }
         if self.capturing.get().is_some() {
             self.end_capture();
         }
         self.cancel_pick();
+        // The About window belongs to this window: it goes with it and comes
+        // back with it (see `show_window`). The flag is only set here, so
+        // hiding an already hidden window keeps it.
+        if let Some(about) = self.about.borrow().as_ref()
+            && about.window().is_visible()
+        {
+            self.about_hidden_with_window.set(true);
+            let _ = about.hide();
+        }
         self.with_ui(|ui| {
             let _ = ui.hide();
         });
@@ -987,6 +1159,180 @@ impl Controller {
             tray.set_window_visible(false);
         }
         info!("window hidden to the notification area");
+    }
+
+    // ---------------------------------------------------------------- layout
+
+    /// Switches between the full and the compact layout. Clicking, the
+    /// settings and overlay mode are unaffected. The window takes the size of
+    /// the new layout; the full layout gets back the size it had.
+    fn toggle_compact(&self) {
+        self.commit_pending_edits();
+        if self.capturing.get().is_some() {
+            self.end_capture();
+        }
+        self.cancel_pick();
+        let Some(ui) = self.ui.upgrade() else { return };
+        if !self.window_visible.get() {
+            return; // only switched from the window itself
+        }
+        let compact = !ui.get_compact_mode();
+        let window = ui.window();
+        self.fit_height.set(false);
+        if compact {
+            // A maximized size is not worth restoring as a normal window.
+            self.full_size.set(
+                (!window.is_maximized()).then(|| window.size().to_logical(window.scale_factor())),
+            );
+        }
+        if window.is_maximized() {
+            window.set_maximized(false);
+        }
+        // Commits an edited field before the full layout's controls go away.
+        ui.invoke_release_field_focus();
+        ui.set_compact_mode(compact);
+        // Slint creates and removes the parts of a layout (`if` elements)
+        // when it next renders; until then the layout size and the window's
+        // size limits are still those of the old layout, and the size set
+        // below would be clamped to them. Showing the already visible window
+        // does that work now (and changes nothing else).
+        if let Err(e) = ui.show() {
+            warn!("could not update the window for the new layout: {e}");
+        }
+        let preferred = LogicalSize::new(
+            ui.get_layout_preferred_width(),
+            ui.get_layout_preferred_height(),
+        );
+        let size = if compact {
+            // The full layout cut off below the status panel: its width.
+            let width = self.full_size.get().map_or(preferred.width, |s| s.width);
+            LogicalSize::new(width, preferred.height)
+        } else if let Some(size) = self.full_size.take() {
+            size
+        } else {
+            // No size to give back (Cadence started in the compact layout).
+            // The full layout's height depends on its width (descriptions
+            // wrap) and was measured at the compact width, so it is measured
+            // again once the window has its new width.
+            let width = window.size().to_logical(window.scale_factor()).width;
+            self.fit_height.set((width - preferred.width).abs() >= 0.5);
+            preferred
+        };
+        if !compact {
+            keep_on_screen(&ui, size);
+        }
+        window.set_size(size);
+        self.config.borrow_mut().window.compact = compact;
+        self.save();
+        info!("{} layout", if compact { "compact" } else { "full" });
+    }
+
+    /// Completes a switch to the full layout (see [`Self::toggle_compact`]):
+    /// the window has the layout's width now, so its height can be measured.
+    fn fit_height_to_layout(&self) {
+        if !self.fit_height.replace(false) {
+            return;
+        }
+        let Some(ui) = self.ui.upgrade() else { return };
+        let window = ui.window();
+        let width = window.size().to_logical(window.scale_factor()).width;
+        let size = LogicalSize::new(width, ui.get_layout_preferred_height());
+        keep_on_screen(&ui, size);
+        window.set_size(size);
+    }
+
+    // ---------------------------------------------------------------- overlay
+
+    fn toggle_overlay(&self, source: OverlaySource) {
+        if self.closed.get() {
+            return;
+        }
+        if self.overlay_active.get() {
+            self.leave_overlay();
+            // Switched off to use the window ("press F9 to interact"): bring
+            // it to the front. Without overlay mode it may no longer be
+            // always on top, and a full-screen program would then cover it.
+            if !self.overlay_active.get() && source != OverlaySource::Window {
+                activate_own_window(form::APP_NAME);
+            }
+        } else {
+            self.enter_overlay(source);
+        }
+    }
+
+    /// Turns overlay mode on: the window becomes translucent, lets clicks
+    /// pass through and stays in front. It needs the window on screen and the
+    /// overlay hotkey registered, the quick way back.
+    fn enter_overlay(&self, source: OverlaySource) {
+        self.commit_pending_edits();
+        if self.capturing.get().is_some() {
+            self.end_capture();
+        }
+        self.cancel_pick();
+        let Some(ui) = self.ui.upgrade() else { return };
+        if !self.window_visible.get() || ui.window().is_minimized() {
+            if source == OverlaySource::Hotkey {
+                // Showing the window now would take the keyboard focus from
+                // the program in use.
+                info!("overlay hotkey ignored: the window is not shown");
+                return;
+            }
+            self.show_window();
+            if !self.window_visible.get() {
+                return; // could not be shown (logged)
+            }
+        }
+        let hotkey = self.runtime.borrow().hotkey_status(HotkeyAction::Overlay);
+        if let Some(reason) = overlay::blocker(&hotkey) {
+            warn!("overlay mode not turned on: {reason}");
+            self.show_notice(reason);
+            return;
+        }
+        // Keys typed into the window still reach it: take the keyboard
+        // focus off its controls.
+        ui.invoke_release_field_focus();
+        let t = overlay::turn_on(&NativeWindow(ui.window()), OVERLAY_ALPHA);
+        self.set_overlay_active(t.active);
+        match (t.error, t.active) {
+            (None, _) => info!("overlay mode on"),
+            (Some(e), false) => {
+                error!("could not turn on overlay mode: {e}");
+                self.show_notice(format!("Overlay mode could not be turned on ({e})."));
+            }
+            (Some(e), true) => {
+                error!("overlay mode is only partly set up: {e}");
+                self.show_notice(format!(
+                    "Overlay mode did not turn on cleanly ({e}). Turn it off with its hotkey or \
+                     the tray icon."
+                ));
+            }
+        }
+    }
+
+    /// Turns overlay mode off: normal opacity and mouse input again.
+    fn leave_overlay(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let t = overlay::turn_off(&NativeWindow(ui.window()));
+        self.set_overlay_active(t.active);
+        match t.error {
+            None => info!("overlay mode off"),
+            Some(e) => {
+                error!("could not turn off overlay mode: {e}");
+                self.show_notice(format!(
+                    "Overlay mode could not be turned off ({e}). Try again, or exit Cadence from \
+                     the tray icon."
+                ));
+            }
+        }
+    }
+
+    /// Shows the verified overlay state in the window and the tray.
+    fn set_overlay_active(&self, active: bool) {
+        self.overlay_active.set(active);
+        self.with_ui(|ui| ui.set_overlay_active(active));
+        if let Some(tray) = &self.tray {
+            tray.set_overlay_active(active);
+        }
     }
 
     fn open_logs(&self) {
@@ -1011,6 +1357,11 @@ impl Controller {
             return self.report.get();
         }
         self.commit_pending_edits();
+        // While the window can still be restored; the native window goes
+        // away with the process either way.
+        if self.overlay_active.get() {
+            self.leave_overlay();
+        }
         self.closed.set(true);
         info!("shutting down");
         self.cancel_pick();
@@ -1037,6 +1388,149 @@ impl Controller {
         cond.notify_all();
         let _ = slint::quit_event_loop();
         report
+    }
+}
+
+thread_local! {
+    /// Set while the About window is created: the creation hook makes it an
+    /// owned window of this window (see [`select_backend`]).
+    static DIALOG_OWNER: Cell<Option<isize>> = const { Cell::new(None) };
+}
+
+/// Selects Slint's winit backend with a hook that creates a window as an
+/// owned window of [`DIALOG_OWNER`] while that is set: a native Win32 owner
+/// relationship, set when the window is created. Once per process; if a
+/// backend was already chosen, the About window is simply not owned.
+///
+/// Windows keeps an owned window above its owner (also when the owner is
+/// activated or clicked), hides it while the owner is minimized, and keeps it
+/// on the owner's level: always on top exactly while the main window is
+/// (Always on top, overlay mode), never on its own. Ownership is about
+/// Z-order only: the owned window keeps its own position (see
+/// [`place_dialog`]).
+///
+/// Limitation: the owner is applied only when the native window is created.
+/// Slint 1.18.1 destroys and later re-creates the native window of a hidden
+/// window when its event loop stops, or on hide when the
+/// `SLINT_DESTROY_WINDOW_ON_HIDE` environment variable is set, and the
+/// re-created window gets default attributes: the About window would then
+/// be an ordinary, independent window (still working, only not owned).
+/// Cadence keeps the event loop running until it exits, so the About window
+/// is created once and stays owned. A Slint upgrade must check this again
+/// (the GUI test `about_is_an_owned_dialog_with_its_own_position` reopens
+/// About in one running event loop and fails if the window is re-created).
+fn select_backend() {
+    static SELECTED: std::sync::Once = std::sync::Once::new();
+    SELECTED.call_once(|| {
+        let selected = slint::BackendSelector::new()
+            .backend_name("winit".into())
+            .with_winit_window_attributes_hook(|attributes| match DIALOG_OWNER.with(Cell::get) {
+                Some(owner) => attributes.with_owner_window(owner),
+                None => attributes,
+            })
+            .select();
+        if let Err(e) = selected {
+            warn!("could not configure the window backend ({e}); dialogs are not owned windows");
+        }
+    });
+}
+
+/// Places `about` over the main window's upper right (see
+/// [`dialog::over_upper_right`]), inside the work area of its monitor. Only
+/// when About is opened: nothing moves it afterwards. Does nothing while the
+/// main window is minimized.
+fn place_dialog(ui: &MainWindow, about: &AboutWindow) {
+    let owner = ui.window().with_winit_window(|w| {
+        let pos = w.outer_position().ok()?;
+        let (outer, inner) = (w.outer_size(), w.inner_size());
+        if inner.width == 0 || inner.height == 0 {
+            return None; // minimized
+        }
+        Some((
+            Rect::new(
+                pos.x,
+                pos.y,
+                pos.x + outer.width as i32,
+                pos.y + outer.height as i32,
+            ),
+            (
+                outer.width as i32 - inner.width as i32,
+                outer.height as i32 - inner.height as i32,
+            ),
+        ))
+    });
+    let Some(Some((owner, frame))) = owner else {
+        return;
+    };
+    // Measured once it exists; before, its size plus the main window's frame.
+    let size = about
+        .window()
+        .with_winit_window(|w| {
+            let s = w.outer_size();
+            (s.width as i32, s.height as i32)
+        })
+        .unwrap_or_else(|| {
+            let scale = ui.window().scale_factor();
+            let inner = about
+                .window()
+                .size()
+                .to_logical(about.window().scale_factor());
+            (
+                (inner.width * scale).round() as i32 + frame.0,
+                (inner.height * scale).round() as i32 + frame.1,
+            )
+        });
+    let work = NativeWindow(ui.window())
+        .hwnd()
+        .ok()
+        .and_then(|h| monitor_work_area(h).ok());
+    let p = dialog::over_upper_right(owner, size, work);
+    about.window().set_position(PhysicalPosition::new(p.x, p.y));
+}
+
+/// Before the window grows to the inner `size` (back to the full layout):
+/// moves it, if needed, so it will lie inside the work area of its monitor.
+///
+/// The growth is drawn once, in full, right away. What is drawn where the
+/// window is off the screen does not reach it, and Slint's software renderer
+/// (1.18) redraws only what changed in the window's contents: it ignores
+/// Windows' requests to repaint a part that comes into view, and marks the
+/// whole window as painted after each frame. A part grown off the screen
+/// (e.g. below a compact window near the bottom edge) would stay black,
+/// stale or see-through when the window is moved back, until the next full
+/// redraw. Moved just enough, the growth is drawn on screen; a window that
+/// already fits does not move.
+fn keep_on_screen(ui: &MainWindow, size: LogicalSize) {
+    let window = ui.window();
+    let current = window.with_winit_window(|w| {
+        let pos = w.outer_position().ok()?;
+        let (outer, inner) = (w.outer_size(), w.inner_size());
+        Some((
+            pos,
+            outer.width as i32 - inner.width as i32,
+            outer.height as i32 - inner.height as i32,
+        ))
+    });
+    let Some(Some((pos, frame_width, frame_height))) = current else {
+        return;
+    };
+    let Some(work) = NativeWindow(window)
+        .hwnd()
+        .ok()
+        .and_then(|h| monitor_work_area(h).ok())
+    else {
+        return;
+    };
+    let inner = size.to_physical(window.scale_factor());
+    let grown = Rect::new(
+        pos.x,
+        pos.y,
+        pos.x + inner.width as i32 + frame_width,
+        pos.y + inner.height as i32 + frame_height,
+    );
+    let p = dialog::keep_inside(grown, work);
+    if (p.x, p.y) != (pos.x, pos.y) {
+        window.set_position(PhysicalPosition::new(p.x, p.y));
     }
 }
 
