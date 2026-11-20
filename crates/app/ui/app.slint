@@ -596,10 +596,9 @@ component WindowActions inherits HorizontalLayout {
 }
 
 // The status, the main action and the window actions, in one card at the
-// top of both layouts: the same component, metrics and size in both (only
-// its width follows the window's). Nothing in it depends on the layout but
-// the label of the layout button; an error grows it in the full layout only
-// (the compact layout shows it in the line below the card instead).
+// top of both layouts. The compact layout is the full layout cut off below
+// it, so it is the same element with the same contents in both (an error
+// message included); only the layout button's label differs.
 component StatusPanel inherits Rectangle {
     in property <RunStatus> status;
     in property <string> headline;
@@ -607,7 +606,7 @@ component StatusPanel inherits Rectangle {
     in property <bool> compact;
     in property <bool> overlay-active;
     in property <string> overlay-key;
-    /// An error, shown as a message under the status (full layout).
+    /// An error, shown as a message under the status.
     in property <string> error;
     callback start-stop();
     callback overlay-clicked();
@@ -650,7 +649,7 @@ component StatusPanel inherits Rectangle {
 export component AboutWindow inherits Window {
     in property <string> version;
     callback close-clicked();
-    /// The size the window opens at (read by Rust to place it beside the
+    /// The size the window opens at (read by Rust to place it over the
     /// main window before it is shown).
     out property <length> layout-preferred-width: 380px;
     out property <length> layout-preferred-height: about-layout.preferred-height;
@@ -744,8 +743,6 @@ export component MainWindow inherits Window {
     in property <bool> overlay-active;
     /// The overlay hotkey ("" if unbound), shown on the Overlay button.
     in property <string> overlay-key;
-    /// Where and how often Cadence clicks, shown by the compact layout.
-    in property <string> summary-text;
 
     // ---- user actions ----
     callback start-stop-clicked();
@@ -783,7 +780,9 @@ export component MainWindow inherits Window {
     out property <bool> pick-enabled: root.fixed-mode;
     /// The size of the current layout, which the window takes when the
     /// layout changes (read by Rust).
-    out property <length> layout-preferred-width: root.compact-mode ? 360px : 420px;
+    // The compact layout is the full layout cut off below the status panel:
+    // the same width (Rust keeps the window's current width when switching).
+    out property <length> layout-preferred-width: 420px;
     out property <length> layout-preferred-height: main-layout.preferred-height;
     /// The status panel's bounds in the window (checked by the layout test).
     out property <length> status-panel-x: status-panel.absolute-position.x;
@@ -816,7 +815,7 @@ export component MainWindow inherits Window {
     // Overlay mode keeps the window in front: the program clicked through it
     // is activated and would otherwise cover it.
     always-on-top: root.keep-on-top || root.overlay-active;
-    min-width: root.compact-mode ? 320px : 400px;
+    min-width: 400px;
     preferred-width: root.layout-preferred-width;
     // The compact layout is exactly as tall as its content.
     max-height: root.compact-mode ? main-layout.preferred-height : main-layout.max-height;
@@ -858,8 +857,6 @@ export component MainWindow inherits Window {
     // hidden controls (or hidden keyboard stops).
     main-layout := VerticalLayout {
         padding: 14px;
-        // The compact layout's last line has 2-3 px of space inside it.
-        padding-bottom: root.compact-mode ? 10px : 14px;
         spacing: Theme.gap;
 
         if root.config-warning != "": Message {
@@ -870,9 +867,10 @@ export component MainWindow inherits Window {
         }
 
         // ---- status, main action and window actions ----
-        // The same panel, 91 px tall, in both layouts. The full layout shows
-        // an error as a message in it, and notices below it; the compact
-        // layout a line below it instead (see there).
+        // The same panel in both layouts; the compact layout ends with it
+        // (14 + 91 + 14 = 119 px, taller only while an error is shown in it).
+        // Everything below it (notices, tabs, settings, footer) exists in the
+        // full layout only.
         status-panel := StatusPanel {
             status: root.status;
             headline: root.status-headline;
@@ -880,7 +878,7 @@ export component MainWindow inherits Window {
             compact: root.compact-mode;
             overlay-active: root.overlay-active;
             overlay-key: root.overlay-key;
-            error: root.compact-mode ? "" : root.error-text;
+            error: root.error-text;
             start-stop => { root.start-stop-clicked(); }
             overlay-clicked => {
                 root.release-field-focus();
@@ -890,22 +888,6 @@ export component MainWindow inherits Window {
                 root.release-field-focus();
                 root.compact-toggled();
             }
-        }
-
-        // Compact layout: a line below the panel saying where and how often
-        // Cadence clicks, with an error or a notice (e.g. Start without a
-        // position) in its place, so the window never changes size:
-        // 14 + 91 + 10 + 17 + 10 = exactly the 142 px of the compact window.
-        if root.compact-mode: Text {
-            height: 17px;
-            text: root.error-text != "" ? root.error-text
-                : root.notice-text != "" ? root.notice-text : root.summary-text;
-            color: root.error-text != "" ? Theme.error
-                : root.notice-text != "" ? Palette.foreground : Theme.muted;
-            font-size: Theme.caption-size;
-            vertical-alignment: center;
-            horizontal-alignment: center;
-            overflow: elide;
         }
 
         // Problem notices (e.g. Start without a position), below the status

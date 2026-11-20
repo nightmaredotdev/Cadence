@@ -70,7 +70,6 @@ fn populate(ui: &MainWindow) {
     ui.set_hold_text("10".into());
     ui.set_radius_text("3".into());
     ui.set_target_text("640, 360".into());
-    ui.set_summary_text("Fixed position 640, 360 · 100 ms".into());
 }
 
 /// A rendered window.
@@ -83,14 +82,6 @@ struct Frame {
 impl Frame {
     fn at(&self, x: usize, y: usize) -> [u8; 3] {
         self.pixels[y * self.width + x]
-    }
-
-    /// The pixels of the `width` x `height` area at (`x`, `y`).
-    fn area(&self, x: usize, y: usize, width: usize, height: usize) -> Vec<[u8; 3]> {
-        (y..y + height)
-            .flat_map(|row| (x..x + width).map(move |col| (col, row)))
-            .map(|(col, row)| self.at(col, row))
-            .collect()
     }
 
     /// The status panel's bounds (x, y, width, height) as drawn: where its
@@ -129,54 +120,77 @@ fn panel_layout(ui: &MainWindow) -> (f32, f32, f32, f32) {
     )
 }
 
-/// The full layout's status panel, laid out and as drawn.
-const FULL_PANEL: (usize, usize, usize, usize) = (14, 14, 392, 91);
+/// A rectangle (x, y, width, height) in a rendered window.
+type Bounds = (usize, usize, usize, usize);
 
-/// The compact layout's status panel: the full layout's, at the compact
-/// window's width (60 px narrower, the difference between the windows'
-/// widths), with the same height, margins and contents.
-const COMPACT_PANEL: (usize, usize, usize, usize) = (14, 14, 332, 91);
+/// The status panel, laid out and as drawn, in both layouts (but while an
+/// error message is shown in it).
+const PANEL: Bounds = (14, 14, 392, 91);
 
-fn as_lengths((x, y, w, h): (usize, usize, usize, usize)) -> (f32, f32, f32, f32) {
+/// The compact window: the full layout cut off 14 px below the panel.
+const COMPACT: (f32, f32) = (420.0, 119.0);
+
+fn as_lengths((x, y, w, h): Bounds) -> (f32, f32, f32, f32) {
     (x as f32, y as f32, w as f32, h as f32)
 }
 
-/// Checks the compact layout's status panel, laid out and as drawn.
-fn check_compact_panel(ui: &MainWindow, frame: &Frame, name: &str) {
-    assert_eq!(
-        panel_layout(ui),
-        as_lengths(COMPACT_PANEL),
-        "{name}: laid out"
-    );
-    assert_eq!(frame.panel_bounds(), COMPACT_PANEL, "{name}: as drawn");
+/// Sets up one of the states the panel is checked in (all others undone).
+fn set_state(ui: &MainWindow, state: &str) {
+    ui.set_status(RunStatus::Stopped);
+    ui.set_status_headline("Stopped".into());
+    ui.set_notice_text("".into());
+    ui.set_error_text("".into());
+    ui.set_overlay_active(false);
+    match state {
+        "normal" => {}
+        "running" => {
+            ui.set_status(RunStatus::Running);
+            ui.set_status_headline("Running".into());
+        }
+        "notice" => ui.set_notice_text(
+            "No target set. Use Pick target or the set-target hotkey first.".into(),
+        ),
+        "error" => {
+            ui.set_status(RunStatus::Error);
+            ui.set_status_headline("Error".into());
+            ui.set_error_text(
+                "Could not press the mouse button: Access is denied (Win32 error 5)".into(),
+            );
+        }
+        "overlay" => ui.set_overlay_active(true),
+        _ => unreachable!("{state}"),
+    }
 }
 
-/// The status panel drawn the same in both layouts: every part that does not
-/// depend on the width (the corners, border, paddings and spacing, the status
-/// row, the divider and the overlay button), pixel for pixel. Only the space
-/// between the headline and the button, and the layout button's label, differ.
-fn check_same_panel(full: &Frame, compact: &Frame) {
-    let (x, y, full_width, height) = FULL_PANEL;
-    let compact_width = COMPACT_PANEL.2;
-    // From the left edge: 170 px, all rows.
-    assert!(
-        full.area(x, y, 170, height) == compact.area(x, y, 170, height),
-        "the panel's left part differs between the layouts"
+/// The panel drawn the same in both layouts, pixel for pixel, but for the
+/// layout button at the right of its bottom strip ("Compact" in the full
+/// layout, "Full view" in the compact one); in overlay mode, where that
+/// strip shows the same hint in both, entirely.
+fn check_same_pixels(full: &Frame, compact: &Frame, (x, y, w, h): Bounds, state: &str) {
+    let overlay = state == "overlay";
+    // The strip: 36 px above the bottom border, below the divider.
+    let layout_button = |col: usize, row: usize| {
+        !overlay && (y + h - 37..y + h - 1).contains(&row) && (x + w / 2..x + w - 6).contains(&col)
+    };
+    let differing = (y..y + h)
+        .flat_map(|row| (x..x + w).map(move |col| (col, row)))
+        .filter(|&(col, row)| !layout_button(col, row) && full.at(col, row) != compact.at(col, row))
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{state}: {differing} pixels of the panel differ between the layouts"
     );
-    // From the right edge: 150 px of the status row, down to the divider
-    // (1 + 10 + 32 + 10 px below the top edge, included).
-    let right = |width: usize| x + width - 150;
-    assert!(
-        full.area(right(full_width), y, 150, 54) == compact.area(right(compact_width), y, 150, 54),
-        "the panel's status row differs between the layouts at the right"
-    );
-    // The right edge (border and padding), all rows.
-    let edge = |width: usize| x + width - 6;
-    assert!(
-        full.area(edge(full_width), y, 6, height)
-            == compact.area(edge(compact_width), y, 6, height),
-        "the panel's right edge differs between the layouts"
-    );
+}
+
+/// Nothing but the window background below the compact layout's panel
+/// (inside overlay mode's frame along the window's edge).
+fn check_nothing_below(frame: &Frame, (_, y, _, h): Bounds, state: &str) {
+    let background = frame.at(4, 4);
+    let others = (y + h..frame.height - 4)
+        .flat_map(|row| (4..frame.width - 4).map(move |col| (col, row)))
+        .filter(|&(col, row)| frame.at(col, row) != background)
+        .count();
+    assert_eq!(others, 0, "{state}: something is drawn below the panel");
 }
 
 /// Renders the window at its layout size; saves it if snapshots are on.
@@ -253,58 +267,62 @@ fn compact_and_overlay_layouts() {
     let full = layout_size(&window, &ui);
     assert_eq!(full.0, 420.0, "the full layout keeps its width");
     assert!(full.1 > 400.0, "{full:?}");
-    let full_frame = render(&window, &ui, "full");
-    assert_eq!(panel_layout(&ui), as_lengths(FULL_PANEL), "full: laid out");
-    assert_eq!(full_frame.panel_bounds(), FULL_PANEL, "full: as drawn");
+    render(&window, &ui, "full");
 
-    // The compact layout: the same status panel, and a summary line below it.
+    // The compact layout is the full layout cut off below the status panel:
+    // in every state, the same panel (laid out, as drawn and pixel for
+    // pixel) at the same place, and nothing else but its margins.
+    for state in ["normal", "running", "notice", "error", "overlay"] {
+        set_state(&ui, state);
+        ui.set_compact_mode(false);
+        // (A notice adds a line below the panel to the full layout.)
+        layout_size(&window, &ui);
+        let full_frame = render(&window, &ui, &format!("full-{state}"));
+        let panel = full_frame.panel_bounds();
+        assert_eq!(
+            panel_layout(&ui),
+            as_lengths(panel),
+            "{state}: full, laid out"
+        );
+        if state == "error" {
+            // The error message is in the panel, in both layouts.
+            assert_eq!((panel.0, panel.1, panel.2), (PANEL.0, PANEL.1, PANEL.2));
+            assert!(panel.3 > PANEL.3, "{state}: {panel:?}");
+        } else {
+            assert_eq!(panel, PANEL, "{state}: full, as drawn");
+        }
+
+        ui.set_compact_mode(true);
+        let compact = layout_size(&window, &ui);
+        let frame = render(&window, &ui, &format!("compact-{state}"));
+        assert_eq!(frame.panel_bounds(), panel, "{state}: compact, as drawn");
+        assert_eq!(
+            panel_layout(&ui),
+            as_lengths(panel),
+            "{state}: compact, laid out"
+        );
+        assert_eq!(
+            compact,
+            (COMPACT.0, (panel.1 + panel.3 + 14) as f32),
+            "{state}: the compact window is the panel and its margins"
+        );
+        if state != "error" {
+            assert_eq!(compact, COMPACT, "{state}: the compact window");
+        }
+        check_same_pixels(&full_frame, &frame, panel, state);
+        check_nothing_below(&frame, panel, state);
+    }
+    set_state(&ui, "normal");
     ui.set_compact_mode(true);
-    let compact = layout_size(&window, &ui);
-    assert_eq!(compact, (360.0, 142.0), "the compact window is 360 x 142");
-    let frame = render(&window, &ui, "compact");
-    check_compact_panel(&ui, &frame, "compact");
-    check_same_panel(&full_frame, &frame);
+    render(&window, &ui, "compact");
 
-    // Running and a long headline (it is elided, not cut off by the button).
-    ui.set_status(RunStatus::Running);
-    ui.set_status_headline("Running".into());
-    let frame = render(&window, &ui, "compact-running");
-    check_compact_panel(&ui, &frame, "compact, running");
+    // A long headline is elided, not cut off by the button: no size change.
     ui.set_status(RunStatus::Waiting);
     ui.set_status_headline("Release modifier keys…".into());
-    assert_eq!(layout_size(&window, &ui), compact);
-    ui.set_status(RunStatus::Stopped);
-    ui.set_status_headline("Stopped".into());
-
-    // A notice takes the summary's place, so the compact window keeps its size.
-    ui.set_notice_text("No target set. Use Pick target or the set-target hotkey first.".into());
-    assert_eq!(layout_size(&window, &ui), compact);
-    let frame = render(&window, &ui, "compact-notice");
-    check_compact_panel(&ui, &frame, "compact, notice");
-    ui.set_notice_text("".into());
-
-    // So does an error (the headline already says "Error").
-    ui.set_status(RunStatus::Error);
-    ui.set_status_headline("Error".into());
-    ui.set_error_text("Could not press the mouse button: Access is denied (Win32 error 5)".into());
-    assert_eq!(layout_size(&window, &ui), compact);
-    let frame = render(&window, &ui, "compact-error");
-    check_compact_panel(&ui, &frame, "compact, error");
-    ui.set_error_text("".into());
-    ui.set_status(RunStatus::Stopped);
-    ui.set_status_headline("Stopped".into());
-
-    // Overlay mode replaces the view buttons with a hint of the same height,
-    // in both layouts: turning it on or off never resizes the window.
-    ui.set_overlay_active(true);
-    assert_eq!(layout_size(&window, &ui), compact);
-    let frame = render(&window, &ui, "compact-overlay");
-    check_compact_panel(&ui, &frame, "compact, overlay");
-    ui.set_compact_mode(false);
-    assert_eq!(layout_size(&window, &ui), full);
-    let frame = render(&window, &ui, "full-overlay");
-    assert_eq!(frame.panel_bounds(), FULL_PANEL, "full, overlay: as drawn");
-    ui.set_overlay_active(false);
+    assert_eq!(layout_size(&window, &ui), COMPACT);
+    set_state(&ui, "normal");
+    let compact = layout_size(&window, &ui);
+    assert_eq!(compact, COMPACT);
 
     // Back and forth: each layout always has the same size.
     for _ in 0..3 {

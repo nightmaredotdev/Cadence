@@ -33,10 +33,10 @@ mod imp {
     use cadence_core::geometry::{Point, Rect};
     use cadence_core::keys::{Hotkey, Key, Modifiers};
     use cadence_platform::diagnostics::{
-        HookEvent, MouseHookRecorder, TestWindow, WindowInfo, WindowKind, click_unmarked,
-        click_unmarked_button, client_rect, cursor_position, force_foreground, foreground_window,
-        is_above, monitors, move_window, post_close, send_keys, window_at, windows_of_process,
-        work_area_of,
+        HookEvent, MouseHookRecorder, TestWindow, WindowInfo, WindowKind, capture_screen,
+        click_unmarked, click_unmarked_button, client_rect, cursor_position, force_foreground,
+        foreground_window, is_above, monitors, move_window, post_close, send_keys, window_at,
+        windows_of_process, work_area_of,
     };
     use cadence_platform::{HotkeyService, WindowsInput};
     use slint::{ComponentHandle, LogicalSize, Model, Timer, TimerMode};
@@ -1244,7 +1244,7 @@ mod imp {
         let full = size_of(client_rect(gui).unwrap());
         assert_overlay_off(&app);
 
-        step("compact layout: a small window with status, Start/Stop and a summary");
+        step("compact layout: the full layout cut off below the status panel");
         ui.invoke_compact_toggled();
         pump_until("compact window", Duration::from_secs(3), || {
             size_of(client_rect(gui).unwrap()).1 < full.1 / 2
@@ -1252,15 +1252,60 @@ mod imp {
         pump(Duration::from_millis(200));
         let compact = size_of(client_rect(gui).unwrap());
         assert!(ui.get_compact_mode());
-        assert!(compact.0 < full.0, "narrower: {compact:?} vs {full:?}");
+        assert_eq!(compact.0, full.0, "the full layout cut off: the same width");
         assert_eq!(
             compact.1 as f32,
             (ui.get_layout_preferred_height() * ui.window().scale_factor()).round(),
             "exactly as tall as the compact layout"
         );
-        assert_eq!(ui.get_summary_text(), "Current position · 100 ms");
         assert_eq!(ui.get_toggle_key(), "F13", "Start/Stop shows its hotkey");
         assert!(saved(&path).window.compact, "the layout is saved");
+
+        step("compact layout: expanded near the bottom of the screen, on screen and drawn");
+        let start = main_window("Cadence").rect;
+        let monitor = monitors()
+            .into_iter()
+            .find(|m| {
+                (m.left..m.right).contains(&start.left) && (m.top..m.bottom).contains(&start.top)
+            })
+            .expect("the window's monitor");
+        // The lower half of the compact window below the screen's edge.
+        let low = monitor.bottom - (start.bottom - start.top) / 2;
+        ui.window()
+            .set_position(slint::PhysicalPosition::new(start.left, low));
+        pump_until("moved down", Duration::from_secs(2), || {
+            main_window("Cadence").rect.top == low
+        });
+        ui.invoke_compact_toggled();
+        pump_until("full window", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == full
+        });
+        pump(Duration::from_millis(400));
+        let grown = main_window("Cadence").rect;
+        let work = work_area_of(gui).expect("work area");
+        assert!(
+            grown.left >= work.left
+                && grown.top >= work.top
+                && grown.right <= work.right
+                && grown.bottom <= work.bottom,
+            "grown inside the work area: {grown:?} in {work:?}"
+        );
+        assert_eq!(grown.left, start.left, "moved up only");
+        assert_drawn(gui, "after growing");
+        // Moved elsewhere, as the user would: drawn everywhere.
+        ui.window()
+            .set_position(slint::PhysicalPosition::new(work.left + 40, work.top + 40));
+        pump(Duration::from_millis(400));
+        assert_drawn(gui, "after moving");
+        ui.invoke_compact_toggled();
+        pump_until("compact again", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == compact
+        });
+        ui.window()
+            .set_position(slint::PhysicalPosition::new(start.left, start.top));
+        pump_until("back where it was", Duration::from_secs(2), || {
+            main_window("Cadence").rect.top == start.top
+        });
 
         step("compact layout: switching while clicking keeps clicking and the settings");
         let settings = app.config();
@@ -1463,16 +1508,41 @@ mod imp {
         (r.right - r.left, r.bottom - r.top)
     }
 
-    /// Where the About window opens: beside `main`, inside the work area of
-    /// its monitor.
-    fn expected_about(main: &WindowInfo, about: &WindowInfo, scale: f32) -> Point {
-        let gap = (cadence::dialog::GAP * scale).round() as i32;
-        cadence::dialog::beside(
+    /// Where the About window opens: over `main`'s upper right, inside the
+    /// work area of its monitor.
+    fn expected_about(main: &WindowInfo, about: &WindowInfo) -> Point {
+        cadence::dialog::over_upper_right(
             main.rect,
             size_of_rect(about.rect),
             work_area_of(main.id),
-            gap,
         )
+    }
+
+    fn covers(a: Rect, b: Rect) -> bool {
+        a.left <= b.left && a.top <= b.top && a.right >= b.right && a.bottom >= b.bottom
+    }
+
+    /// The full layout's client area, as on screen, is drawn everywhere: its
+    /// 14 px margins (left, right and bottom) show the window's background
+    /// in every row and column. An area left undrawn shows black, stale
+    /// content or the windows behind instead. (Clear of the rounded corners.)
+    fn assert_drawn(window: cadence_platform::diagnostics::WindowId, what: &str) {
+        let r = client_rect(window).expect("client area");
+        let pixels = capture_screen(r).expect("screen capture");
+        let (width, height) = ((r.right - r.left) as usize, (r.bottom - r.top) as usize);
+        let at = |x: usize, y: usize| pixels[y * width + x];
+        let background = at(6, 6);
+        let margins = (0..height - 12)
+            .flat_map(|y| (3..11).chain(width - 11..width - 3).map(move |x| (x, y)))
+            .chain((height - 10..height - 4).flat_map(|y| (12..width - 12).map(move |x| (x, y))));
+        let undrawn: Vec<(usize, usize)> =
+            margins.filter(|&(x, y)| at(x, y) != background).collect();
+        assert!(
+            undrawn.is_empty(),
+            "{what}: {} margin pixels are not the background {background:?}, the first at {:?}",
+            undrawn.len(),
+            undrawn.first()
+        );
     }
 
     fn overlap(a: Rect, b: Rect) -> bool {
@@ -1669,11 +1739,11 @@ mod imp {
     }
 
     /// Opens About and checks it: owned by the main window, the same native
-    /// window as at its first opening, beside the main window and not over
-    /// it. The first position is set before the window exists, from its
-    /// expected size, so a few pixels of frame difference are allowed then.
+    /// window as at its first opening, over the main window's upper right,
+    /// leaving part of it uncovered. The first position is set before the
+    /// window exists, from its expected size, so a few pixels of frame
+    /// difference are allowed then.
     fn open_about(app: &Rc<App>, state: &Rc<RefCell<AboutRun>>, tolerance: i32) -> Vec<Step> {
-        let scale = app.ui().window().scale_factor();
         let (app, state) = (app.clone(), state.clone());
         vec![
             act(move || app.ui().invoke_about_clicked()),
@@ -1692,14 +1762,14 @@ mod imp {
                     ),
                 }
                 let at = Point::new(about.rect.left, about.rect.top);
-                let expected = expected_about(&main, &about, scale);
+                let expected = expected_about(&main, &about);
                 assert!(
                     near(at, expected, tolerance),
                     "About at {at}, expected {expected}"
                 );
                 assert!(
-                    !overlap(about.rect, main.rect),
-                    "About opens beside the main window, not over it: {:?} / {:?}",
+                    overlap(about.rect, main.rect) && !covers(about.rect, main.rect),
+                    "About opens over part of the main window: {:?} / {:?}",
                     about.rect,
                     main.rect
                 );
@@ -1761,7 +1831,7 @@ mod imp {
         let a = &app;
         let mut steps = vec![
             Step::Say(
-                "about (in one event loop): the first opening creates an owned window beside the main window",
+                "about (in one event loop): the first opening creates an owned window over the main window",
             ),
             wait_for("the main window", || {
                 own_windows()
@@ -1809,7 +1879,7 @@ mod imp {
         steps.push(act({
             let other = other.clone();
             move || {
-                // Over both windows (About is beside the main window).
+                // Over both windows (About sticks out past the main window).
                 let (m, a) = (main_window("Cadence").rect, about_window().unwrap().rect);
                 let r = Rect::new(
                     m.left.min(a.left) - 20,
@@ -2020,6 +2090,34 @@ mod imp {
             steps.push(settle(Duration::from_millis(200)));
             steps.push(record_main(&state));
         }
+
+        // Programmatically: the compact layout has no About button.
+        steps.push(Step::Say("about: opened over the compact window"));
+        steps.push(act({
+            let app = app.clone();
+            move || app.ui().invoke_compact_toggled()
+        }));
+        steps.push(wait_for("the compact window", {
+            let app = app.clone();
+            move || app.ui().get_compact_mode() && size_of_rect(main_window("Cadence").rect).1 < 300
+        }));
+        steps.push(settle(Duration::from_millis(200)));
+        steps.push(record_main(&state));
+        steps.extend(open_about(a, &state, 1));
+        steps.push(act(|| about_above_main(false)));
+        steps.extend(close_about(&state));
+        steps.push(act({
+            let app = app.clone();
+            move || app.ui().invoke_compact_toggled()
+        }));
+        steps.push(wait_for("the full window", {
+            let app = app.clone();
+            move || {
+                !app.ui().get_compact_mode() && size_of_rect(main_window("Cadence").rect).1 > 400
+            }
+        }));
+        steps.push(settle(Duration::from_millis(200)));
+        steps.push(record_main(&state));
 
         steps.push(Step::Say(
             "about: usable above the overlay; closing it keeps overlay mode on",

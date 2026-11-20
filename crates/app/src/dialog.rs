@@ -1,41 +1,58 @@
-//! Where a dialog (the About window) opens: beside the window it belongs to,
-//! not over it, so both stay visible, and inside the work area of that
-//! window's monitor. Only the opening position: after that the dialog's
-//! position is its own.
+//! Window placement: where a dialog (the About window) opens over the
+//! window it belongs to, and how a window is kept inside the work area of
+//! its monitor (the monitor minus the taskbar). Only opening positions: after
+//! that a dialog's position is its own.
 
 #![forbid(unsafe_code)]
 
 use cadence_core::geometry::{Point, Rect};
 
-/// The space between a window and a dialog opened beside it, in logical
-/// pixels (window frames, invisible resize borders included).
-pub const GAP: f32 = 12.0;
-
-/// The top-left position of a dialog of `size` (width, height) opened beside
-/// `owner`, `gap` pixels apart: to its right, or to its left when there is
-/// no room on the right, top edges aligned. All in physical screen pixels,
-/// outer window bounds.
+/// The top-left position of a dialog of `size` (width, height) opened over
+/// `owner`: offset towards the owner's upper right, overlapping it, with
+/// part of the owner left uncovered. All in physical screen pixels, outer
+/// window bounds.
 ///
-/// Kept inside `work` when given. When the dialog fits on neither side, it
-/// goes on the side with more room, moved in just enough to stay inside the
-/// work area (it then overlaps the owner as little as possible).
-pub fn beside(owner: Rect, size: (i32, i32), work: Option<Rect>, gap: i32) -> Point {
+/// The offsets follow from both sizes, so the result looks alike for the
+/// full and the compact window and at any scale:
+/// - across, the dialog's centre is a quarter of the owner's width in from
+///   the owner's right edge (never centred: a quarter of the owner's width
+///   right of centre), but at least a quarter of the owner stays uncovered
+///   on the left;
+/// - down, its top edge is a sixth of the smaller of the two heights below
+///   the owner's top edge (the owner's title bar mostly stays visible).
+///
+/// Inside `work` when given: when it would stick out on the right, it is
+/// mirrored to the owner's upper left; then it is moved in as little as
+/// needed.
+pub fn over_upper_right(owner: Rect, size: (i32, i32), work: Option<Rect>) -> Point {
     let (width, height) = size;
-    let right = owner.right + gap;
-    let left = owner.left - gap - width;
+    let (owner_width, owner_height) = (owner.right - owner.left, owner.bottom - owner.top);
+    let dx = (owner_width * 3 / 4 - width / 2).max(owner_width / 4);
+    let dy = owner_height.min(height) / 6;
+    let right = owner.left + dx;
+    let y = owner.top + dy;
     let Some(work) = work else {
-        return Point::new(right, owner.top);
+        return Point::new(right, y);
     };
+    let left = owner.right - dx - width;
     let x = if right + width <= work.right {
         right
     } else if left >= work.left {
         left
-    } else if work.right - owner.right >= owner.left - work.left {
-        fit(right, width, work.left, work.right)
     } else {
-        fit(left, width, work.left, work.right)
+        fit(right, width, work.left, work.right)
     };
-    Point::new(x, fit(owner.top, height, work.top, work.bottom))
+    Point::new(x, fit(y, height, work.top, work.bottom))
+}
+
+/// The top-left position that keeps `rect` inside `work`, moved as little as
+/// possible (its own position when it already fits). When it is larger than
+/// the work area, its top-left corner goes to the work area's.
+pub fn keep_inside(rect: Rect, work: Rect) -> Point {
+    Point::new(
+        fit(rect.left, rect.right - rect.left, work.left, work.right),
+        fit(rect.top, rect.bottom - rect.top, work.top, work.bottom),
+    )
 }
 
 /// Moves `start` (with `length`) inside `[low, high)`; if it does not fit,
@@ -49,69 +66,112 @@ mod tests {
     use super::*;
 
     const WORK: Rect = Rect::new(0, 0, 1920, 1040);
-    const ABOUT: (i32, i32) = (382, 501);
+    /// The About window and the full and compact main windows at 100 %
+    /// (outer bounds), and the About and full windows at 150 %.
+    const ABOUT: (i32, i32) = (396, 445);
+    const FULL: (i32, i32) = (436, 644);
+    const COMPACT: (i32, i32) = (436, 158);
+    const ABOUT_150: (i32, i32) = (594, 668);
+    const FULL_150: (i32, i32) = (654, 966);
 
-    fn overlaps(a: Rect, p: Point, (width, height): (i32, i32)) -> bool {
-        p.x < a.right && a.left < p.x + width && p.y < a.bottom && a.top < p.y + height
+    fn at(x: i32, y: i32, (width, height): (i32, i32)) -> Rect {
+        Rect::new(x, y, x + width, y + height)
+    }
+
+    fn overlap(a: Rect, b: Rect) -> bool {
+        a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
     }
 
     #[test]
-    fn a_dialog_opens_to_the_right_of_its_owner() {
-        let owner = Rect::new(100, 50, 522, 687);
-        let p = beside(owner, ABOUT, Some(WORK), 12);
-        assert_eq!(p, Point::new(534, 50));
-        assert!(!overlaps(owner, p, ABOUT));
-        // The compact window: smaller than the dialog, still beside it.
-        let owner = Rect::new(800, 400, 1162, 574);
-        assert_eq!(beside(owner, ABOUT, Some(WORK), 12), Point::new(1174, 400));
+    fn a_dialog_opens_over_the_upper_right_of_the_full_window() {
+        let owner = at(200, 100, FULL);
+        let p = over_upper_right(owner, ABOUT, Some(WORK));
+        // 436 * 3/4 - 396/2 = 129 across, 445/6 = 74 down.
+        assert_eq!(p, Point::new(329, 174));
+        let dialog = at(p.x, p.y, ABOUT);
+        assert!(overlap(dialog, owner));
+        // Part of the owner uncovered on the left, at the top and below.
+        assert!(dialog.left - owner.left >= FULL.0 / 4);
+        assert!(dialog.top > owner.top && dialog.bottom < owner.bottom);
+        // Not centred: a quarter of the owner's width right of centre.
+        let centred = owner.left + (FULL.0 - ABOUT.0) / 2;
+        assert_eq!(p.x - centred, FULL.0 / 4);
     }
 
     #[test]
-    fn without_room_on_the_right_it_opens_on_the_left() {
-        let owner = Rect::new(1400, 100, 1822, 737);
-        let p = beside(owner, ABOUT, Some(WORK), 12);
-        assert_eq!(p, Point::new(1006, 100));
-        assert!(!overlaps(owner, p, ABOUT));
-        // Exactly enough room on the right: the right.
-        let owner = Rect::new(1000, 100, 1526, 737);
-        assert_eq!(beside(owner, ABOUT, Some(WORK), 12).x, 1538);
+    fn the_offsets_follow_the_sizes_of_both_windows() {
+        // The compact window, shorter than the dialog: a sixth of its height.
+        let owner = at(200, 100, COMPACT);
+        let p = over_upper_right(owner, ABOUT, Some(WORK));
+        assert_eq!(p, Point::new(329, 126));
+        assert!(overlap(at(p.x, p.y, ABOUT), owner));
+        // At 150 % everything scales: 654 * 3/4 - 594/2 = 193, 668/6 = 111.
+        let owner = at(200, 100, FULL_150);
+        assert_eq!(
+            over_upper_right(owner, ABOUT_150, Some(WORK)),
+            Point::new(393, 211)
+        );
+        // A dialog much wider than its owner still leaves a quarter of it.
+        let owner = at(200, 100, (300, 400));
+        assert_eq!(
+            over_upper_right(owner, (600, 200), Some(WORK)),
+            Point::new(275, 133)
+        );
     }
 
     #[test]
-    fn it_stays_inside_the_work_area_vertically() {
-        // Near the bottom (above the taskbar): moved up, still beside.
-        let owner = Rect::new(100, 866, 462, 1040);
-        assert_eq!(beside(owner, ABOUT, Some(WORK), 12), Point::new(474, 539));
-        // Above the top of the work area: moved down.
-        let owner = Rect::new(100, -20, 462, 154);
-        assert_eq!(beside(owner, ABOUT, Some(WORK), 12), Point::new(474, 0));
+    fn near_the_right_edge_it_opens_over_the_upper_left() {
+        let owner = at(1450, 100, FULL);
+        let p = over_upper_right(owner, ABOUT, Some(WORK));
+        // Mirrored: its right edge 129 px in from the owner's right edge.
+        assert_eq!(p, Point::new(1450 + 436 - 129 - 396, 174));
+        let dialog = at(p.x, p.y, ABOUT);
+        assert!(overlap(dialog, owner));
+        assert!(owner.right - dialog.right >= FULL.0 / 4);
+    }
+
+    #[test]
+    fn it_stays_inside_the_work_area() {
+        // Near the bottom (above the taskbar): moved up.
+        let owner = at(200, 900, COMPACT);
+        assert_eq!(
+            over_upper_right(owner, ABOUT, Some(WORK)),
+            Point::new(329, 595)
+        );
         // A second monitor left of the first, with negative coordinates.
         let left = Rect::new(-1280, 0, 0, 984);
-        let owner = Rect::new(-1200, 100, -838, 274);
-        assert_eq!(beside(owner, ABOUT, Some(left), 12), Point::new(-826, 100));
+        let owner = at(-1200, 100, FULL);
+        assert_eq!(
+            over_upper_right(owner, ABOUT, Some(left)),
+            Point::new(-1071, 174)
+        );
+        // No room on either side (a narrow work area): moved in.
+        let narrow = Rect::new(0, 0, 500, 1040);
+        let owner = at(50, 100, FULL);
+        assert_eq!(
+            over_upper_right(owner, ABOUT, Some(narrow)),
+            Point::new(104, 174)
+        );
+        // Without a work area: the plain offsets.
+        let owner = at(0, 0, FULL);
+        assert_eq!(over_upper_right(owner, ABOUT, None), Point::new(129, 74));
     }
 
     #[test]
-    fn with_room_on_neither_side_it_overlaps_as_little_as_possible() {
-        // A wide owner, more room on the right (270 px): at the right edge.
-        let owner = Rect::new(220, 100, 1650, 900);
-        let p = beside(owner, ABOUT, Some(WORK), 12);
-        assert_eq!(p, Point::new(1538, 100));
-        // More room on the left (350 px): at the left edge.
-        let owner = Rect::new(350, 100, 1750, 900);
-        assert_eq!(beside(owner, ABOUT, Some(WORK), 12), Point::new(0, 100));
-    }
-
-    #[test]
-    fn a_dialog_larger_than_the_work_area_keeps_its_title_bar_visible() {
-        let small = Rect::new(0, 0, 300, 400);
-        let owner = Rect::new(0, 0, 300, 400);
-        assert_eq!(beside(owner, ABOUT, Some(small), 12), Point::new(0, 0));
-    }
-
-    #[test]
-    fn without_a_work_area_it_opens_to_the_right() {
-        let owner = Rect::new(0, 0, 362, 174);
-        assert_eq!(beside(owner, ABOUT, None, 12), Point::new(374, 0));
+    fn a_window_is_moved_as_little_as_needed_to_fit() {
+        // Already inside: unchanged.
+        assert_eq!(keep_inside(at(100, 100, FULL), WORK), Point::new(100, 100));
+        // Hanging below the bottom (the full window grown from a compact one
+        // near the bottom edge): moved up just enough.
+        assert_eq!(keep_inside(at(100, 900, FULL), WORK), Point::new(100, 396));
+        // ...and past the right and left edges.
+        assert_eq!(
+            keep_inside(at(1700, 100, FULL), WORK),
+            Point::new(1484, 100)
+        );
+        assert_eq!(keep_inside(at(-50, 100, FULL), WORK), Point::new(0, 100));
+        // Taller than the work area: the title bar at its top.
+        let short = Rect::new(0, 0, 1920, 600);
+        assert_eq!(keep_inside(at(100, 300, FULL), short), Point::new(100, 0));
     }
 }

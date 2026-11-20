@@ -610,13 +610,6 @@ impl Controller {
         ui.set_error_text(view.error.into());
         ui.set_window_title(view.window_title.into());
         ui.set_target_text(view.target.into());
-        self.refresh_summary(ui);
-    }
-
-    /// The compact layout's line about where and how often it clicks.
-    fn refresh_summary(&self, ui: &MainWindow) {
-        let summary = form::summary(&self.config.borrow().click, self.interval_unit.get());
-        ui.set_summary_text(summary.into());
     }
 
     fn show_notice(&self, text: String) {
@@ -662,7 +655,6 @@ impl Controller {
         self.send(Command::UpdateSettings(settings));
         self.config.borrow_mut().click = click;
         self.save();
-        self.with_ui(|ui| self.refresh_summary(ui));
         Ok(())
     }
 
@@ -774,7 +766,6 @@ impl Controller {
             &ui,
             &TimingFields::from_config(&config, self.interval_unit.get()),
         );
-        self.refresh_summary(&ui);
     }
 
     // ---------------------------------------------------------------- target
@@ -1059,9 +1050,10 @@ impl Controller {
 
     /// Shows the About window: an owned window of the main window (it stays
     /// above it, is hidden with it when minimized and has no taskbar button
-    /// of its own) with a position of its own. Each opening places it beside
-    /// the main window; after that it stays where it is (or where the user
-    /// moves it) whatever the main window does.
+    /// of its own) with a position of its own. Each opening places it over
+    /// the main window's upper right (see [`place_dialog`]); after that it
+    /// stays where it is (or where the user moves it) whatever the main
+    /// window does.
     fn show_about(&self) {
         self.commit_pending_edits();
         let Some(ui) = self.ui.upgrade() else { return };
@@ -1212,7 +1204,9 @@ impl Controller {
             ui.get_layout_preferred_height(),
         );
         let size = if compact {
-            preferred
+            // The full layout cut off below the status panel: its width.
+            let width = self.full_size.get().map_or(preferred.width, |s| s.width);
+            LogicalSize::new(width, preferred.height)
         } else if let Some(size) = self.full_size.take() {
             size
         } else {
@@ -1224,6 +1218,9 @@ impl Controller {
             self.fit_height.set((width - preferred.width).abs() >= 0.5);
             preferred
         };
+        if !compact {
+            keep_on_screen(&ui, size);
+        }
         window.set_size(size);
         self.config.borrow_mut().window.compact = compact;
         self.save();
@@ -1239,7 +1236,9 @@ impl Controller {
         let Some(ui) = self.ui.upgrade() else { return };
         let window = ui.window();
         let width = window.size().to_logical(window.scale_factor()).width;
-        window.set_size(LogicalSize::new(width, ui.get_layout_preferred_height()));
+        let size = LogicalSize::new(width, ui.get_layout_preferred_height());
+        keep_on_screen(&ui, size);
+        window.set_size(size);
     }
 
     // ---------------------------------------------------------------- overlay
@@ -1436,9 +1435,10 @@ fn select_backend() {
     });
 }
 
-/// Places `about` beside the main window (see [`dialog::beside`]), inside the
-/// work area of its monitor. Only when About is opened: nothing moves it
-/// afterwards. Does nothing while the main window is minimized.
+/// Places `about` over the main window's upper right (see
+/// [`dialog::over_upper_right`]), inside the work area of its monitor. Only
+/// when About is opened: nothing moves it afterwards. Does nothing while the
+/// main window is minimized.
 fn place_dialog(ui: &MainWindow, about: &AboutWindow) {
     let owner = ui.window().with_winit_window(|w| {
         let pos = w.outer_position().ok()?;
@@ -1484,9 +1484,54 @@ fn place_dialog(ui: &MainWindow, about: &AboutWindow) {
         .hwnd()
         .ok()
         .and_then(|h| monitor_work_area(h).ok());
-    let gap = (dialog::GAP * ui.window().scale_factor()).round() as i32;
-    let p = dialog::beside(owner, size, work, gap);
+    let p = dialog::over_upper_right(owner, size, work);
     about.window().set_position(PhysicalPosition::new(p.x, p.y));
+}
+
+/// Before the window grows to the inner `size` (back to the full layout):
+/// moves it, if needed, so it will lie inside the work area of its monitor.
+///
+/// The growth is drawn once, in full, right away. What is drawn where the
+/// window is off the screen does not reach it, and Slint's software renderer
+/// (1.18) redraws only what changed in the window's contents: it ignores
+/// Windows' requests to repaint a part that comes into view, and marks the
+/// whole window as painted after each frame. A part grown off the screen
+/// (e.g. below a compact window near the bottom edge) would stay black,
+/// stale or see-through when the window is moved back, until the next full
+/// redraw. Moved just enough, the growth is drawn on screen; a window that
+/// already fits does not move.
+fn keep_on_screen(ui: &MainWindow, size: LogicalSize) {
+    let window = ui.window();
+    let current = window.with_winit_window(|w| {
+        let pos = w.outer_position().ok()?;
+        let (outer, inner) = (w.outer_size(), w.inner_size());
+        Some((
+            pos,
+            outer.width as i32 - inner.width as i32,
+            outer.height as i32 - inner.height as i32,
+        ))
+    });
+    let Some(Some((pos, frame_width, frame_height))) = current else {
+        return;
+    };
+    let Some(work) = NativeWindow(window)
+        .hwnd()
+        .ok()
+        .and_then(|h| monitor_work_area(h).ok())
+    else {
+        return;
+    };
+    let inner = size.to_physical(window.scale_factor());
+    let grown = Rect::new(
+        pos.x,
+        pos.y,
+        pos.x + inner.width as i32 + frame_width,
+        pos.y + inner.height as i32 + frame_height,
+    );
+    let p = dialog::keep_inside(grown, work);
+    if (p.x, p.y) != (pos.x, pos.y) {
+        window.set_position(PhysicalPosition::new(p.x, p.y));
+    }
 }
 
 enum BindError {
