@@ -6,20 +6,31 @@
 
 #![cfg(windows)]
 
-use cadence::ui::{HotkeyRow, MainWindow, Palette, RunStatus};
+use cadence::ui::{AboutWindow, HotkeyRow, MainWindow, Palette, RunStatus};
 use cadence_platform::diagnostics::bmp;
 use slint::language::ColorScheme;
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{Platform, WindowAdapter};
 use slint::{ComponentHandle, LogicalSize, Model, ModelRc, Rgb8Pixel, VecModel};
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-struct Offscreen(Rc<MinimalSoftwareWindow>);
+/// A window for each component (the main window, the About window).
+#[derive(Clone, Default)]
+struct Offscreen(Rc<RefCell<Vec<Rc<MinimalSoftwareWindow>>>>);
+
+impl Offscreen {
+    fn last(&self) -> Rc<MinimalSoftwareWindow> {
+        self.0.borrow().last().expect("a window").clone()
+    }
+}
 
 impl Platform for Offscreen {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
-        Ok(self.0.clone())
+        let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+        self.0.borrow_mut().push(window.clone());
+        Ok(window)
     }
 }
 
@@ -65,6 +76,11 @@ fn populate(ui: &MainWindow) {
 /// Renders the window at its layout size; saves it if snapshots are on.
 fn render(window: &MinimalSoftwareWindow, ui: &MainWindow, name: &str) {
     let (w, h) = layout_size(window, ui);
+    draw(window, w, h, name);
+}
+
+/// Renders `window` at `width` x `height`; saves it if snapshots are on.
+fn draw(window: &MinimalSoftwareWindow, w: f32, h: f32, name: &str) {
     window.set_size(LogicalSize::new(w, h));
     let size = window.size();
     let (width, height) = (size.width as usize, size.height as usize);
@@ -115,9 +131,10 @@ fn render_dark(window: &MinimalSoftwareWindow, ui: &MainWindow) {
 
 #[test]
 fn compact_and_overlay_layouts() {
-    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(Offscreen(window.clone()))).unwrap();
+    let platform = Offscreen::default();
+    slint::platform::set_platform(Box::new(platform.clone())).unwrap();
     let ui = MainWindow::new().unwrap();
+    let window = platform.last();
     populate(&ui);
     ui.show().unwrap();
 
@@ -185,7 +202,17 @@ fn compact_and_overlay_layouts() {
     assert_eq!(ui.get_hotkeys().row_count(), 4);
     render(&window, &ui, "full-again");
 
+    // The About window, in the same visual language.
+    let about = AboutWindow::new().unwrap();
+    about.set_version("1.1.0".into());
+    about.show().unwrap();
+    draw(&platform.last(), 380.0, 470.0, "about");
+
     if std::env::var_os("CADENCE_LAYOUT_SNAPSHOTS").is_some() {
         render_dark(&window, &ui);
+        about
+            .global::<Palette>()
+            .set_color_scheme(ColorScheme::Dark);
+        draw(&platform.last(), 380.0, 470.0, "dark-about");
     }
 }

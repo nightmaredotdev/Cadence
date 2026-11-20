@@ -3,7 +3,7 @@
 // Logic lives in Rust (crates/app/src/gui.rs); this file only lays out the
 // window and forwards user actions through callbacks.
 
-import { Button, CheckBox, Palette, AboutSlint, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, Palette, AboutSlint } from "std-widgets.slint";
 
 // Lets the layout test render both colour schemes.
 export { Palette }
@@ -32,10 +32,11 @@ global Theme {
     out property <color> subtle-hover: Palette.foreground.transparentize(92%);
     out property <color> subtle-pressed: Palette.foreground.transparentize(95%);
     out property <length> gap: 10px;
-    out property <length> card-padding: 14px;
+    out property <length> card-padding: 12px;
     out property <length> control-height: 32px;
     out property <length> control-radius: 4px;
     out property <length> card-radius: 8px;
+    out property <length> title-size: 20px;
     out property <length> caption-size: 12px;
     out property <length> small-size: 11px;
 }
@@ -222,7 +223,7 @@ component StatusRow inherits HorizontalLayout {
     in property <RunStatus> status;
     in property <string> headline;
     in property <string> toggle-key;
-    in property <length> headline-size: 20px;
+    in property <length> headline-size: Theme.title-size;
     in property <length> button-width: 120px;
     callback start-stop();
     spacing: 12px;
@@ -257,23 +258,27 @@ component Message inherits Rectangle {
     in property <bool> dismissable: false;
     callback dismissed;
     background: root.tone.transparentize(88%);
-    border-radius: 6px;
+    border-radius: Theme.control-radius;
     border-width: 1px;
     border-color: root.tone.transparentize(60%);
     layout := HorizontalLayout {
         padding: 8px;
+        padding-left: 10px;
         spacing: 8px;
         Text {
             text: root.text;
             wrap: word-wrap;
             color: Palette.foreground;
-            font-size: 12px;
+            font-size: Theme.caption-size;
             horizontal-stretch: 1;
             vertical-alignment: center;
         }
-        if root.dismissable: Button {
-            text: "Dismiss";
-            clicked => { root.dismissed(); }
+        if root.dismissable: VerticalLayout {
+            alignment: center;
+            SubtleButton {
+                text: "Dismiss";
+                clicked => { root.dismissed(); }
+            }
         }
     }
 }
@@ -290,26 +295,35 @@ component NumberField inherits Rectangle {
     public function focus-input() {
         input.focus();
     }
-    min-height: 32px;
-    border-radius: 4px;
+    min-height: Theme.control-height;
+    border-radius: Theme.control-radius;
     border-width: 1px;
-    border-color: Palette.border;
+    // A stronger border on hover, like the other controls' hover states.
+    border-color: root.enabled && area.has-hover && !input.has-focus
+        ? Palette.foreground.transparentize(70%) : Palette.border;
     background: root.enabled ? Palette.control-background : Palette.control-background.transparentize(60%);
     clip: true;
-    input := TextInput {
-        x: 8px;
-        width: parent.width - 16px;
-        height: parent.height;
+    animate border-color { duration: 120ms; }
+    // Also takes clicks in the padding around the text, which focus it.
+    area := TouchArea {
         enabled: root.enabled;
-        single-line: true;
-        input-type: decimal;
-        horizontal-alignment: right;
-        vertical-alignment: center;
-        color: root.enabled ? Palette.control-foreground : Theme.idle;
-        selection-background-color: Palette.selection-background;
-        selection-foreground-color: Palette.selection-foreground;
-        edited => { root.edited(); }
-        accepted => { root.accepted(); }
+        mouse-cursor: MouseCursor.text;
+        clicked => { input.focus(); }
+        input := TextInput {
+            x: 8px;
+            width: parent.width - 16px;
+            height: parent.height;
+            enabled: root.enabled;
+            single-line: true;
+            input-type: decimal;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            color: root.enabled ? Palette.control-foreground : Theme.idle;
+            selection-background-color: Palette.selection-background;
+            selection-foreground-color: Palette.selection-foreground;
+            edited => { root.edited(); }
+            accepted => { root.accepted(); }
+        }
     }
     // Focus indicator, like Fluent's text fields.
     if input.has-focus: Rectangle {
@@ -347,7 +361,7 @@ component FieldRow inherits HorizontalLayout {
         if root.description != "": Text {
             text: root.description;
             color: root.enabled ? Theme.muted : Theme.idle;
-            font-size: 11px;
+            font-size: Theme.small-size;
             wrap: word-wrap;
         }
     }
@@ -540,6 +554,47 @@ component OverlayHint inherits Rectangle {
     }
 }
 
+// The window-level actions, below the status in both layouts (so the layout
+// toggle stays in the same place): overlay mode on the left, the other
+// layout on the right. In overlay mode the window ignores the mouse, so the
+// badge naming the hotkey that ends it takes their place, at the same
+// height (the window never changes size for it).
+component WindowActions inherits HorizontalLayout {
+    in property <bool> compact;
+    in property <bool> overlay-active;
+    in property <string> overlay-key;
+    in property <length> vertical-padding;
+    in property <length> horizontal-padding;
+    callback overlay-clicked();
+    callback layout-clicked();
+    spacing: 4px;
+    padding-top: root.vertical-padding;
+    padding-bottom: root.vertical-padding;
+    padding-left: root.horizontal-padding;
+    padding-right: root.horizontal-padding;
+    // A layout's min-height includes its padding.
+    min-height: Theme.control-height + 2 * root.vertical-padding;
+    if !root.overlay-active: SubtleButton {
+        text: "Overlay";
+        icon: Icons.overlay;
+        shortcut: root.overlay-key;
+        clicked => { root.overlay-clicked(); }
+    }
+    if !root.overlay-active: Rectangle { horizontal-stretch: 1; }
+    if !root.overlay-active: SubtleButton {
+        text: root.compact ? "Full view" : "Compact";
+        icon: root.compact ? Icons.expand : Icons.compact;
+        clicked => { root.layout-clicked(); }
+    }
+    if root.overlay-active: HorizontalLayout {
+        alignment: center;
+        VerticalLayout {
+            alignment: center;
+            OverlayHint { key: root.overlay-key; }
+        }
+    }
+}
+
 export component AboutWindow inherits Window {
     in property <string> version;
     callback close-clicked();
@@ -547,18 +602,33 @@ export component AboutWindow inherits Window {
     icon: @image-url("../../../assets/icon/icon-256.png");
     min-width: 380px;
     preferred-width: 380px;
-    VerticalBox {
+    background: Palette.background;
+    VerticalLayout {
         padding: 20px;
-        spacing: 10px;
+        spacing: 12px;
         alignment: start;
-        Text {
-            text: "Cadence";
-            font-size: 22px;
-            font-weight: 700;
-        }
-        Text {
-            text: "Version " + root.version;
-            color: Theme.muted;
+        HorizontalLayout {
+            spacing: 12px;
+            Image {
+                source: @image-url("../../../assets/icon/icon-256.png");
+                width: 40px;
+                height: 40px;
+                accessible-role: none;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                Text {
+                    text: "Cadence";
+                    font-size: Theme.title-size;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Version " + root.version;
+                    font-size: Theme.caption-size;
+                    color: Theme.muted;
+                }
+            }
         }
         Text {
             text: "A desktop autoclicker with precise, configurable click timing, human-like variation, clicking at a fixed position or at the cursor, and global hotkeys.";
@@ -567,7 +637,7 @@ export component AboutWindow inherits Window {
         Text {
             text: "Licensed under the MIT License.";
             color: Theme.muted;
-            font-size: 12px;
+            font-size: Theme.caption-size;
         }
         AboutSlint {
             min-height: 150px;
@@ -739,15 +809,49 @@ export component MainWindow inherits Window {
             }
         }
 
-        // ---- full layout: status and main action ----
-        if !root.compact-mode: Card {
-            StatusRow {
-                status: root.status;
-                headline: root.status-headline;
-                toggle-key: root.toggle-key;
-                start-stop => { root.start-stop-clicked(); }
+        // ---- full layout: status, main action and window actions ----
+        // The same panel as the compact layout: the window actions in a strip
+        // below the status, clearly apart from the tabs further down.
+        if !root.compact-mode: Rectangle {
+            background: Palette.alternate-background;
+            border-radius: Theme.card-radius;
+            border-width: 1px;
+            border-color: Palette.border.transparentize(40%);
+            VerticalLayout {
+                padding: 1px;
+                VerticalLayout {
+                    padding: 10px;
+                    padding-left: Theme.card-padding - 1px;
+                    padding-right: Theme.card-padding - 1px;
+                    spacing: 8px;
+                    StatusRow {
+                        status: root.status;
+                        headline: root.status-headline;
+                        toggle-key: root.toggle-key;
+                        start-stop => { root.start-stop-clicked(); }
+                    }
+                    if root.error-text != "": Message { text: root.error-text; }
+                }
+                Rectangle {
+                    height: 1px;
+                    background: Theme.divider;
+                }
+                WindowActions {
+                    vertical-padding: 2px;
+                    horizontal-padding: 5px;
+                    compact: false;
+                    overlay-active: root.overlay-active;
+                    overlay-key: root.overlay-key;
+                    overlay-clicked => {
+                        root.release-field-focus();
+                        root.overlay-clicked();
+                    }
+                    layout-clicked => {
+                        root.release-field-focus();
+                        root.compact-toggled();
+                    }
+                }
             }
-            if root.error-text != "": Message { text: root.error-text; }
         }
 
         // ---- compact layout: one panel ----
@@ -795,30 +899,14 @@ export component MainWindow inherits Window {
             Rectangle {
                 height: 40px;
                 background: Palette.alternate-background;
-                HorizontalLayout {
-                    padding: 4px;
-                    padding-left: 6px;
-                    padding-right: 6px;
-                    spacing: 4px;
-                    if !root.overlay-active: SubtleButton {
-                        text: "Overlay";
-                        icon: Icons.overlay;
-                        shortcut: root.overlay-key;
-                        clicked => { root.overlay-clicked(); }
-                    }
-                    if !root.overlay-active: Rectangle { horizontal-stretch: 1; }
-                    if !root.overlay-active: SubtleButton {
-                        text: "Full view";
-                        icon: Icons.expand;
-                        clicked => { root.compact-toggled(); }
-                    }
-                    if root.overlay-active: HorizontalLayout {
-                        alignment: center;
-                        VerticalLayout {
-                            alignment: center;
-                            OverlayHint { key: root.overlay-key; }
-                        }
-                    }
+                WindowActions {
+                    vertical-padding: 4px;
+                    horizontal-padding: 6px;
+                    compact: true;
+                    overlay-active: root.overlay-active;
+                    overlay-key: root.overlay-key;
+                    overlay-clicked => { root.overlay-clicked(); }
+                    layout-clicked => { root.compact-toggled(); }
                 }
             }
         }
@@ -828,7 +916,7 @@ export component MainWindow inherits Window {
         if !root.compact-mode && root.notice-text != "": Text {
             text: root.notice-text;
             color: Theme.muted;
-            font-size: 12px;
+            font-size: Theme.caption-size;
             overflow: elide;
             horizontal-alignment: center;
         }
@@ -842,109 +930,75 @@ export component MainWindow inherits Window {
         // last one. A focus ring marks the active tab while the bar has
         // keyboard focus. Reaching the bar with Tab moves the focus off an
         // edited field, which commits it. Mouse clicks do not focus the bar.
-        //
-        // The view buttons (overlay mode, compact layout) sit at the right
-        // end of the tab row. In overlay mode the window ignores the mouse,
-        // so a hint naming the hotkey that ends it takes their place.
-        if !root.compact-mode: VerticalLayout {
-            spacing: 0px;
-            HorizontalLayout {
-                spacing: 8px;
-                tab-bar := FocusScope {
-                    horizontal-stretch: 1;
-                    focus-on-click: false;
-                    accessible-role: tab-list;
-                    accessible-item-count: 2;
-                    changed has-focus => { root.tab-bar-focused = self.has-focus; }
-                    key-pressed(event) => {
-                        if event.modifiers.control || event.modifiers.alt || event.modifiers.meta {
-                            return reject;
-                        }
-                        if event.text == Key.LeftArrow || event.text == Key.RightArrow {
-                            root.current-tab = root.current-tab == 0 ? 1 : 0;
-                            return accept;
-                        }
-                        if event.text == Key.Home {
-                            root.current-tab = 0;
-                            return accept;
-                        }
-                        if event.text == Key.End {
-                            root.current-tab = 1;
-                            return accept;
-                        }
-                        reject
-                    }
-                    HorizontalLayout {
-                        for title[index] in ["Settings", "Hotkeys"]: Rectangle {
-                            horizontal-stretch: 1;
-                            height: 36px;
-                            border-radius: 4px;
-                            accessible-role: tab;
-                            accessible-label: title;
-                            accessible-item-index: index;
-                            accessible-item-selectable: true;
-                            accessible-item-selected: root.current-tab == index;
-                            // Keyboard focus ring on the active tab.
-                            border-width: tab-bar.has-focus && root.current-tab == index ? 2px : 0px;
-                            border-color: Palette.foreground;
-                            tab-area := TouchArea {
-                                clicked => {
-                                    root.release-field-focus();
-                                    root.current-tab = index;
-                                }
-                            }
-                            Text {
-                                text: title;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                                font-weight: root.current-tab == index ? 600 : 400;
-                                // Hover only brightens the label; the active tab
-                                // stays marked by weight and the accent underline.
-                                color: root.current-tab == index || tab-area.has-hover
-                                    ? Palette.foreground : Theme.muted;
-                            }
-                            if root.current-tab == index: Rectangle {
-                                y: parent.height - 3px;
-                                x: (parent.width - 32px) / 2;
-                                width: 32px;
-                                height: 3px;
-                                border-radius: 1.5px;
-                                background: Palette.accent-background;
-                            }
-                        }
-                    }
+        if !root.compact-mode: tab-bar := FocusScope {
+            focus-on-click: false;
+            accessible-role: tab-list;
+            accessible-item-count: 2;
+            changed has-focus => { root.tab-bar-focused = self.has-focus; }
+            key-pressed(event) => {
+                if event.modifiers.control || event.modifiers.alt || event.modifiers.meta {
+                    return reject;
                 }
-                if !root.overlay-active: VerticalLayout {
-                    alignment: center;
-                    SubtleButton {
-                        text: "Overlay";
-                        icon: Icons.overlay;
-                        shortcut: root.overlay-key;
-                        clicked => {
-                            root.release-field-focus();
-                            root.overlay-clicked();
-                        }
-                    }
+                if event.text == Key.LeftArrow || event.text == Key.RightArrow {
+                    root.current-tab = root.current-tab == 0 ? 1 : 0;
+                    return accept;
                 }
-                if !root.overlay-active: VerticalLayout {
-                    alignment: center;
-                    SubtleButton {
-                        text: "Compact";
-                        icon: Icons.compact;
-                        clicked => {
-                            root.release-field-focus();
-                            root.compact-toggled();
-                        }
-                    }
+                if event.text == Key.Home {
+                    root.current-tab = 0;
+                    return accept;
                 }
-                if root.overlay-active: VerticalLayout {
-                    alignment: center;
-                    OverlayHint { key: root.overlay-key; }
+                if event.text == Key.End {
+                    root.current-tab = 1;
+                    return accept;
                 }
+                reject
             }
-            Rectangle {
-                height: 1px;
-                background: Palette.border.transparentize(40%);
+            VerticalLayout {
+                spacing: 0px;
+                HorizontalLayout {
+                    for title[index] in ["Settings", "Hotkeys"]: Rectangle {
+                        horizontal-stretch: 1;
+                        height: 36px;
+                        border-radius: Theme.control-radius;
+                        accessible-role: tab;
+                        accessible-label: title;
+                        accessible-item-index: index;
+                        accessible-item-selectable: true;
+                        accessible-item-selected: root.current-tab == index;
+                        // Keyboard focus ring on the active tab.
+                        border-width: tab-bar.has-focus && root.current-tab == index ? 2px : 0px;
+                        border-color: Palette.foreground;
+                        tab-area := TouchArea {
+                            clicked => {
+                                root.release-field-focus();
+                                root.current-tab = index;
+                            }
+                        }
+                        Text {
+                            text: title;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            font-weight: root.current-tab == index ? 600 : 400;
+                            // Hover only brightens the label; the active tab
+                            // stays marked by weight and the accent underline.
+                            color: root.current-tab == index || tab-area.has-hover
+                                ? Palette.foreground : Theme.muted;
+                            animate color { duration: 120ms; }
+                        }
+                        if root.current-tab == index: Rectangle {
+                            y: parent.height - 3px;
+                            x: (parent.width - 32px) / 2;
+                            width: 32px;
+                            height: 3px;
+                            border-radius: 1.5px;
+                            background: Palette.accent-background;
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 1px;
+                    background: Theme.divider;
+                }
             }
         }
 
@@ -961,7 +1015,6 @@ export component MainWindow inherits Window {
                 width: parent.width;
                 height: parent.height;
                 visible: root.current-tab == 0;
-                padding-top: 10px;
                     spacing: Theme.gap;
                     alignment: start;
                     Card {
@@ -1005,7 +1058,7 @@ export component MainWindow inherits Window {
                                     : "Clicks wherever the cursor is. The cursor is never moved.";
                             font-weight: root.picking ? 600 : 400;
                             color: root.picking ? Palette.foreground : Theme.muted;
-                            font-size: 12px;
+                            font-size: Theme.caption-size;
                             wrap: word-wrap;
                         }
                     }
@@ -1052,7 +1105,7 @@ export component MainWindow inherits Window {
                         if root.settings-pending && root.settings-error == "": Text {
                             text: "Press Enter or leave the field to apply.";
                             color: Theme.muted;
-                            font-size: 11px;
+                            font-size: Theme.small-size;
                         }
                     }
                 }
@@ -1062,7 +1115,6 @@ export component MainWindow inherits Window {
                 width: parent.width;
                 height: parent.height;
                 visible: root.current-tab == 1;
-                padding-top: 10px;
                 spacing: Theme.gap;
                 alignment: start;
                 // All bindings in one card, separated by subtle dividers.
@@ -1071,7 +1123,7 @@ export component MainWindow inherits Window {
                         spacing: 8px;
                         if index > 0: Rectangle {
                             height: 1px;
-                            background: Palette.border.transparentize(30%);
+                            background: Theme.divider;
                         }
                         HorizontalLayout {
                             spacing: 8px;
@@ -1082,7 +1134,7 @@ export component MainWindow inherits Window {
                                 if row.problem != "": Text {
                                     text: row.problem;
                                     color: Theme.error;
-                                    font-size: 11px;
+                                    font-size: Theme.small-size;
                                     wrap: word-wrap;
                                 }
                             }
@@ -1111,7 +1163,7 @@ export component MainWindow inherits Window {
                 if root.capturing-index >= 0: Text {
                     text: "Press the new key combination, or Esc to cancel. If nothing happens, another program already uses that combination.";
                     color: Theme.muted;
-                    font-size: 11px;
+                    font-size: Theme.small-size;
                     wrap: word-wrap;
                 }
             }
