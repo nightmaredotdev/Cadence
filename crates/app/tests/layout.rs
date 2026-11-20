@@ -6,8 +6,9 @@
 
 #![cfg(windows)]
 
-use cadence::ui::{HotkeyRow, MainWindow, RunStatus};
+use cadence::ui::{HotkeyRow, MainWindow, Palette, RunStatus};
 use cadence_platform::diagnostics::bmp;
+use slint::language::ColorScheme;
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{Platform, WindowAdapter};
 use slint::{ComponentHandle, LogicalSize, Model, ModelRc, Rgb8Pixel, VecModel};
@@ -82,6 +83,36 @@ fn render(window: &MinimalSoftwareWindow, ui: &MainWindow, name: &str) {
     }
 }
 
+/// Renders the layouts in the dark colour scheme (snapshots only). Here,
+/// controls that exist when the scheme changes may keep some colours of the
+/// old one, so every rendering follows a layout switch, which recreates them
+/// (the application gets its scheme before the window is first drawn).
+fn render_dark(window: &MinimalSoftwareWindow, ui: &MainWindow) {
+    ui.global::<Palette>().set_color_scheme(ColorScheme::Dark);
+    for (compact, overlay, name) in [
+        (true, false, "dark-compact"),
+        (false, false, "dark-full"),
+        (true, true, "dark-compact-overlay"),
+        (false, true, "dark-full-overlay"),
+    ] {
+        ui.set_compact_mode(compact);
+        ui.set_overlay_active(overlay);
+        render(window, ui, name);
+    }
+    ui.set_overlay_active(false);
+    ui.set_status(RunStatus::Running);
+    ui.set_status_headline("Running".into());
+    ui.set_compact_mode(true);
+    render(window, ui, "dark-compact-running");
+    ui.set_current_tab(1);
+    ui.set_compact_mode(false);
+    render(window, ui, "dark-full-hotkeys-running");
+    ui.set_current_tab(0);
+    ui.set_status(RunStatus::Stopped);
+    ui.set_status_headline("Stopped".into());
+    ui.global::<Palette>().set_color_scheme(ColorScheme::Light);
+}
+
 #[test]
 fn compact_and_overlay_layouts() {
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
@@ -98,11 +129,7 @@ fn compact_and_overlay_layouts() {
     // The compact layout: status, summary and the view buttons only.
     ui.set_compact_mode(true);
     let compact = layout_size(&window, &ui);
-    assert_eq!(compact.0, 360.0);
-    assert!(
-        compact.1 < 180.0 && compact.1 * 3.0 < full.1,
-        "compact {compact:?}, full {full:?}"
-    );
+    assert_eq!(compact, (360.0, 142.0), "the compact window is 360 x 142");
     render(&window, &ui, "compact");
 
     // Running and a long headline (it is elided, not cut off by the button).
@@ -120,6 +147,16 @@ fn compact_and_overlay_layouts() {
     assert_eq!(layout_size(&window, &ui), compact);
     render(&window, &ui, "compact-notice");
     ui.set_notice_text("".into());
+
+    // So does an error (the headline already says "Error").
+    ui.set_status(RunStatus::Error);
+    ui.set_status_headline("Error".into());
+    ui.set_error_text("Could not press the mouse button: Access is denied (Win32 error 5)".into());
+    assert_eq!(layout_size(&window, &ui), compact);
+    render(&window, &ui, "compact-error");
+    ui.set_error_text("".into());
+    ui.set_status(RunStatus::Stopped);
+    ui.set_status_headline("Stopped".into());
 
     // Overlay mode replaces the view buttons with a hint of the same height,
     // in both layouts: turning it on or off never resizes the window.
@@ -147,4 +184,8 @@ fn compact_and_overlay_layouts() {
     assert_eq!(ui.get_radius_text(), "3");
     assert_eq!(ui.get_hotkeys().row_count(), 4);
     render(&window, &ui, "full-again");
+
+    if std::env::var_os("CADENCE_LAYOUT_SNAPSHOTS").is_some() {
+        render_dark(&window, &ui);
+    }
 }

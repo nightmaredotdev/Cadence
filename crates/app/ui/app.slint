@@ -5,6 +5,9 @@
 
 import { Button, CheckBox, Palette, AboutSlint, VerticalBox } from "std-widgets.slint";
 
+// Lets the layout test render both colour schemes.
+export { Palette }
+
 export enum RunStatus { stopped, waiting, running, error }
 
 export struct HotkeyRow {
@@ -14,20 +17,33 @@ export struct HotkeyRow {
     bound: bool,
 }
 
+// Shared colours and metrics. The metrics match Fluent's own controls
+// (32 px tall, 4 px corners), so custom and standard controls line up.
 global Theme {
-    out property <color> running: #0f7b0f;
-    out property <color> waiting: #b26a00;
-    out property <color> error: #c42b1c;
+    property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+    // Status colours (Fluent's system colours, lighter on a dark background).
+    out property <color> running: dark ? #6ccb5f : #0f7b0f;
+    out property <color> waiting: dark ? #fce100 : #9d5d00;
+    out property <color> error: dark ? #ff99a4 : #c42b1c;
     out property <color> idle: Palette.foreground.transparentize(55%);
     out property <color> muted: Palette.foreground.transparentize(35%);
+    out property <color> divider: Palette.border.transparentize(30%);
+    // Flat (subtle) controls: no fill until hovered or pressed.
+    out property <color> subtle-hover: Palette.foreground.transparentize(92%);
+    out property <color> subtle-pressed: Palette.foreground.transparentize(95%);
     out property <length> gap: 10px;
     out property <length> card-padding: 14px;
+    out property <length> control-height: 32px;
+    out property <length> control-radius: 4px;
+    out property <length> card-radius: 8px;
+    out property <length> caption-size: 12px;
+    out property <length> small-size: 11px;
 }
 
 component Card inherits Rectangle {
     in property <string> title;
     background: Palette.alternate-background;
-    border-radius: 8px;
+    border-radius: Theme.card-radius;
     border-width: 1px;
     border-color: Palette.border.transparentize(40%);
     VerticalLayout {
@@ -37,17 +53,201 @@ component Card inherits Rectangle {
             spacing: 6px;
             Text {
                 text: root.title;
-                font-size: 12px;
+                font-size: Theme.small-size;
                 font-weight: 600;
+                letter-spacing: 0.6px;
                 color: Theme.muted;
             }
             // Subtle divider between the heading and the section's controls.
             Rectangle {
                 height: 1px;
-                background: Palette.border.transparentize(30%);
+                background: Theme.divider;
             }
         }
         @children
+    }
+}
+
+// Icons, drawn as 24 x 24 outlines (no image files).
+global Icons {
+    // Two stacked layers.
+    out property <string> overlay: "M12 3 L3 7.5 L12 12 L21 7.5 Z M3 12 L12 16.5 L21 12 M3 16.5 L12 21 L21 16.5";
+    // Arrows pointing inward / outward.
+    out property <string> compact: "M4 14 L10 14 L10 20 M20 10 L14 10 L14 4 M14 10 L21 3 M3 21 L10 14";
+    out property <string> expand: "M15 3 L21 3 L21 9 M9 21 L3 21 L3 15 M21 3 L14 10 M3 21 L10 14";
+}
+
+component Icon inherits Path {
+    in property <color> tone;
+    width: 16px;
+    height: 16px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    stroke: root.tone;
+    stroke-width: 1.6px;
+    accessible-role: none;
+}
+
+// A key or key combination, drawn like a key cap.
+component KeyCap inherits Rectangle {
+    in property <string> key;
+    in property <color> tone: Theme.muted;
+    height: 18px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Palette.foreground.transparentize(78%);
+    background: Palette.foreground.transparentize(95%);
+    accessible-role: none;
+    HorizontalLayout {
+        padding-left: 5px;
+        padding-right: 5px;
+        Text {
+            text: root.key;
+            font-size: Theme.small-size;
+            color: root.tone;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// A flat button for secondary and tertiary actions: text in a muted colour,
+// a subtle fill on hover. `destructive` turns it red on hover (Exit, Clear).
+// Optionally an icon before the text and a key cap after it. One Tab stop;
+// Space or Enter activates it. Like the standard buttons, a click does not
+// take the keyboard focus.
+component SubtleButton inherits Rectangle {
+    in property <string> text;
+    in property <string> icon;
+    in property <string> shortcut;
+    in property <bool> destructive;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    property <bool> hovered: area.has-hover && root.enabled;
+    property <color> tone: !root.enabled ? Theme.idle
+        : root.destructive && root.hovered ? Theme.error
+        : root.hovered || focus.has-focus ? Palette.foreground : Theme.muted;
+
+    min-height: Theme.control-height;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: Theme.control-radius;
+    background: area.pressed && root.enabled
+        ? (root.destructive ? Theme.error.transparentize(90%) : Theme.subtle-pressed)
+        : root.hovered ? (root.destructive ? Theme.error.transparentize(86%) : Theme.subtle-hover)
+        : transparent;
+    animate background { duration: 120ms; }
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if root.enabled { root.clicked(); }
+    }
+
+    focus := FocusScope {
+        focus-on-click: false;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.modifiers.control || event.modifiers.alt || event.modifiers.meta {
+                return reject;
+            }
+            if event.text == Key.Space || event.text == Key.Return {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    area := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+        alignment: center;
+        if root.icon != "": VerticalLayout {
+            alignment: center;
+            Icon {
+                commands: root.icon;
+                tone: root.tone;
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.tone;
+            vertical-alignment: center;
+            animate color { duration: 120ms; }
+        }
+        if root.shortcut != "": VerticalLayout {
+            alignment: center;
+            KeyCap { key: root.shortcut; }
+        }
+    }
+    // Keyboard focus ring, as on the tabs.
+    if focus.has-focus: Rectangle {
+        border-width: 2px;
+        border-radius: root.border-radius;
+        border-color: Palette.foreground;
+    }
+}
+
+// The run state: a filled dot with a soft halo while clicking (or waiting,
+// or after an error), a hollow ring while stopped.
+component StatusDot inherits Rectangle {
+    in property <RunStatus> status;
+    property <bool> active: root.status != RunStatus.stopped;
+    property <color> tone: root.status == RunStatus.running ? Theme.running
+        : root.status == RunStatus.waiting ? Theme.waiting
+        : root.status == RunStatus.error ? Theme.error : Theme.idle;
+    width: 20px;
+    height: 20px;
+    border-radius: 10px;
+    background: root.active ? root.tone.transparentize(80%) : transparent;
+    Rectangle {
+        x: 5px;
+        y: 5px;
+        width: 10px;
+        height: 10px;
+        border-radius: 5px;
+        background: root.active ? root.tone : transparent;
+        border-width: root.active ? 0px : 2px;
+        border-color: root.tone;
+    }
+}
+
+// The status and the main action, shared by both layouts.
+component StatusRow inherits HorizontalLayout {
+    in property <RunStatus> status;
+    in property <string> headline;
+    in property <string> toggle-key;
+    in property <length> headline-size: 20px;
+    in property <length> button-width: 120px;
+    callback start-stop();
+    spacing: 12px;
+    VerticalLayout {
+        alignment: center;
+        StatusDot { status: root.status; }
+    }
+    Text {
+        text: root.headline;
+        horizontal-stretch: 1;
+        vertical-alignment: center;
+        font-size: root.headline-size;
+        font-weight: 700;
+        overflow: elide;
+        color: root.status == RunStatus.error ? Theme.error : Palette.foreground;
+    }
+    VerticalLayout {
+        alignment: center;
+        Button {
+            text: (root.status == RunStatus.running || root.status == RunStatus.waiting ? "Stop" : "Start")
+                + (root.toggle-key != "" ? " (" + root.toggle-key + ")" : "");
+            primary: true;
+            min-width: root.button-width;
+            clicked => { root.start-stop(); }
+        }
     }
 }
 
@@ -262,7 +462,9 @@ component SegmentedControl inherits FocusScope {
                 accessible-checkable: true;
                 accessible-checked: root.selected == index;
                 accessible-action-default => { root.select(index); }
-                background: root.selected == index ? Palette.accent-background : transparent;
+                background: root.selected == index ? Palette.accent-background
+                    : segment-area.has-hover ? Theme.subtle-hover : transparent;
+                animate background { duration: 120ms; }
                 // Keyboard focus ring on the active option.
                 border-width: root.has-focus && root.selected == index ? 2px : 0px;
                 border-color: Palette.foreground;
@@ -284,27 +486,57 @@ component SegmentedControl inherits FocusScope {
 }
 
 // Shown in overlay mode where the view buttons were: the window ignores the
-// mouse then, so it names the hotkey that switches overlay mode off.
-component OverlayHint inherits HorizontalLayout {
+// mouse then, so it names the hotkey that switches overlay mode off. An
+// accent badge, matching the accent frame around the window.
+component OverlayHint inherits Rectangle {
     in property <string> key;
-    spacing: 6px;
-    alignment: end;
+    height: 26px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: 13px;
+    background: Palette.accent-background.transparentize(84%);
+    border-width: 1px;
+    border-color: Palette.accent-background.transparentize(50%);
     accessible-role: text;
-    accessible-label: hint.text;
-    VerticalLayout {
-        alignment: center;
-        Rectangle {
-            width: 8px;
-            height: 8px;
-            border-radius: 4px;
-            background: Palette.accent-background;
+    accessible-label: "Overlay on. Press " + root.key + " to interact.";
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                commands: Icons.overlay;
+                tone: Palette.accent-background;
+                width: 14px;
+                height: 14px;
+            }
         }
-    }
-    hint := Text {
-        text: "Overlay on · press " + root.key + " to interact";
-        font-size: 12px;
-        vertical-alignment: center;
-        overflow: elide;
+        Text {
+            text: "Overlay on";
+            font-size: Theme.caption-size;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        Text {
+            text: "·";
+            font-size: Theme.caption-size;
+            color: Theme.muted;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            alignment: center;
+            KeyCap {
+                key: root.key;
+                tone: Palette.foreground;
+            }
+        }
+        Text {
+            text: "to interact";
+            font-size: Theme.caption-size;
+            color: Theme.muted;
+            vertical-alignment: center;
+        }
     }
 }
 
@@ -490,67 +722,105 @@ export component MainWindow inherits Window {
     }
 
     // The full layout (status, tabs, settings, footer) or the compact one
-    // (status and the view buttons). Both share the status card; the parts
-    // of the full layout are created only while it is shown, so the compact
-    // window has no hidden controls (and no hidden keyboard stops).
+    // (status and the view buttons). Both use the same status row; each
+    // layout's parts are created only while it is shown, so neither has
+    // hidden controls (or hidden keyboard stops).
     main-layout := VerticalLayout {
-        padding: root.compact-mode ? 10px : 14px;
-        spacing: root.compact-mode ? 8px : Theme.gap;
+        padding: root.compact-mode ? 0px : 14px;
+        spacing: root.compact-mode ? 0px : Theme.gap;
 
-        if root.config-warning != "": Message {
-            text: root.config-warning;
-            tone: Theme.waiting;
-            dismissable: true;
-            dismissed => { root.warning-dismissed(); }
+        if root.config-warning != "": VerticalLayout {
+            padding: root.compact-mode ? 10px : 0px;
+            Message {
+                text: root.config-warning;
+                tone: Theme.waiting;
+                dismissable: true;
+                dismissed => { root.warning-dismissed(); }
+            }
         }
 
-        // ---- status and main action ----
-        Card {
-            HorizontalLayout {
-                spacing: 12px;
-                alignment: stretch;
-                Rectangle {
-                    width: 14px;
-                    height: 14px;
-                    y: (parent.height - self.height) / 2;
-                    border-radius: 7px;
-                    background: root.status == RunStatus.running ? Theme.running
-                        : root.status == RunStatus.waiting ? Theme.waiting
-                        : root.status == RunStatus.error ? Theme.error : Theme.idle;
-                }
-                VerticalLayout {
-                    horizontal-stretch: 1;
-                    alignment: center;
-                    spacing: 2px;
-                    Text {
-                        text: root.status-headline;
-                        font-size: root.compact-mode ? 17px : 20px;
-                        font-weight: 700;
-                        overflow: elide;
-                        color: root.status == RunStatus.error ? Theme.error : Palette.foreground;
-                    }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    Button {
-                        text: (root.status == RunStatus.running || root.status == RunStatus.waiting ? "Stop" : "Start")
-                            + (root.toggle-key != "" ? " (" + root.toggle-key + ")" : "");
-                        primary: true;
-                        min-width: root.compact-mode ? 108px : 120px;
-                        clicked => { root.start-stop-clicked(); }
-                    }
-                }
-            }
-            // The compact layout has no settings, so it says where and how
-            // often Cadence clicks. A notice (e.g. Start without a position)
-            // takes this line's place, so the compact window keeps its size.
-            if root.compact-mode: Text {
-                text: root.notice-text != "" ? root.notice-text : root.summary-text;
-                font-size: 12px;
-                color: root.notice-text != "" ? Palette.foreground : Theme.muted;
-                overflow: elide;
+        // ---- full layout: status and main action ----
+        if !root.compact-mode: Card {
+            StatusRow {
+                status: root.status;
+                headline: root.status-headline;
+                toggle-key: root.toggle-key;
+                start-stop => { root.start-stop-clicked(); }
             }
             if root.error-text != "": Message { text: root.error-text; }
+        }
+
+        // ---- compact layout: one panel ----
+        // The status and Start/Stop on top, with a line saying where and how
+        // often Cadence clicks; the view buttons in a strip below. 101 + 1 +
+        // 40 px: exactly as tall as the 142 px compact window.
+        if root.compact-mode: VerticalLayout {
+            Rectangle {
+                height: 101px;
+                VerticalLayout {
+                    padding-left: 16px;
+                    padding-right: 16px;
+                    alignment: center;
+                    spacing: 4px;
+                    StatusRow {
+                        status: root.status;
+                        headline: root.status-headline;
+                        toggle-key: root.toggle-key;
+                        headline-size: 18px;
+                        button-width: 112px;
+                        start-stop => { root.start-stop-clicked(); }
+                    }
+                    // Under the headline (dot 20 px + spacing 12 px). An error
+                    // or a notice (e.g. Start without a position) takes the
+                    // summary's place, so the window keeps its size.
+                    HorizontalLayout {
+                        padding-left: 32px;
+                        Text {
+                            text: root.error-text != "" ? root.error-text
+                                : root.notice-text != "" ? root.notice-text : root.summary-text;
+                            font-size: Theme.caption-size;
+                            color: root.error-text != "" ? Theme.error
+                                : root.notice-text != "" ? Palette.foreground : Theme.muted;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                height: 1px;
+                background: Theme.divider;
+            }
+            // The same height with the overlay hint as with the buttons, so
+            // turning overlay mode on or off never resizes the window.
+            Rectangle {
+                height: 40px;
+                background: Palette.alternate-background;
+                HorizontalLayout {
+                    padding: 4px;
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    spacing: 4px;
+                    if !root.overlay-active: SubtleButton {
+                        text: "Overlay";
+                        icon: Icons.overlay;
+                        shortcut: root.overlay-key;
+                        clicked => { root.overlay-clicked(); }
+                    }
+                    if !root.overlay-active: Rectangle { horizontal-stretch: 1; }
+                    if !root.overlay-active: SubtleButton {
+                        text: "Full view";
+                        icon: Icons.expand;
+                        clicked => { root.compact-toggled(); }
+                    }
+                    if root.overlay-active: HorizontalLayout {
+                        alignment: center;
+                        VerticalLayout {
+                            alignment: center;
+                            OverlayHint { key: root.overlay-key; }
+                        }
+                    }
+                }
+            }
         }
         // Problem notices (e.g. Start without a position), below the status
         // card. The line only exists while there is a notice; no space is
@@ -646,8 +916,10 @@ export component MainWindow inherits Window {
                 }
                 if !root.overlay-active: VerticalLayout {
                     alignment: center;
-                    Button {
-                        text: "Overlay" + (root.overlay-key != "" ? " (" + root.overlay-key + ")" : "");
+                    SubtleButton {
+                        text: "Overlay";
+                        icon: Icons.overlay;
+                        shortcut: root.overlay-key;
                         clicked => {
                             root.release-field-focus();
                             root.overlay-clicked();
@@ -656,15 +928,19 @@ export component MainWindow inherits Window {
                 }
                 if !root.overlay-active: VerticalLayout {
                     alignment: center;
-                    Button {
+                    SubtleButton {
                         text: "Compact";
+                        icon: Icons.compact;
                         clicked => {
                             root.release-field-focus();
                             root.compact-toggled();
                         }
                     }
                 }
-                if root.overlay-active: OverlayHint { key: root.overlay-key; }
+                if root.overlay-active: VerticalLayout {
+                    alignment: center;
+                    OverlayHint { key: root.overlay-key; }
+                }
             }
             Rectangle {
                 height: 1px;
@@ -822,8 +1098,9 @@ export component MainWindow inherits Window {
                                     }
                                 }
                             }
-                            Button {
+                            SubtleButton {
                                 text: "Clear";
+                                destructive: true;
                                 enabled: row.bound && root.capturing-index < 0;
                                 clicked => { root.hotkey-clear(index); }
                             }
@@ -848,38 +1125,20 @@ export component MainWindow inherits Window {
                 toggled => { root.keep-on-top-toggled(self.checked); }
             }
             Rectangle { horizontal-stretch: 1; }
-            Button {
+            // Tertiary actions: flat, so the primary Start/Stop stays the
+            // strongest control. Exit turns red on hover.
+            SubtleButton {
                 text: "Logs";
                 clicked => { root.open-logs-clicked(); }
             }
-            Button {
+            SubtleButton {
                 text: "About";
                 clicked => { root.about-clicked(); }
             }
-            Button {
+            SubtleButton {
                 text: "Exit";
+                destructive: true;
                 clicked => { root.exit-clicked(); }
-            }
-        }
-
-        // ---- compact layout: the view buttons below the status ----
-        // As tall with the overlay hint as with the buttons, so turning
-        // overlay mode on or off never resizes the window.
-        if root.compact-mode: HorizontalLayout {
-            spacing: 8px;
-            min-height: 32px;
-            if !root.overlay-active: Button {
-                text: "Overlay" + (root.overlay-key != "" ? " (" + root.overlay-key + ")" : "");
-                clicked => { root.overlay-clicked(); }
-            }
-            if !root.overlay-active: Rectangle { horizontal-stretch: 1; }
-            if !root.overlay-active: Button {
-                text: "Full view";
-                clicked => { root.compact-toggled(); }
-            }
-            if root.overlay-active: OverlayHint {
-                horizontal-stretch: 1;
-                key: root.overlay-key;
             }
         }
     }
