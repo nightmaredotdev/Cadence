@@ -645,9 +645,9 @@ export component AboutWindow inherits Window {
         }
         HorizontalLayout {
             alignment: end;
-            Button {
+            // A flat secondary action, like Logs, About and Exit.
+            SubtleButton {
                 text: "Close";
-                primary: true;
                 clicked => { root.close-clicked(); }
             }
         }
