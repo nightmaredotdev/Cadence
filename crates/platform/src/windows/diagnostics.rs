@@ -537,6 +537,29 @@ pub fn window_at(p: Point) -> WindowId {
     WindowId(hwnd as usize)
 }
 
+/// Whether top-level window `upper` is above `lower` in the Z-order (false
+/// if either is not a top-level window or they are the same window).
+pub fn is_above(upper: WindowId, lower: WindowId) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDNEXT, GetWindow};
+    if upper == lower || upper.0 == 0 || lower.0 == 0 {
+        return false;
+    }
+    let mut hwnd = upper.0 as HWND;
+    // Bounded, in case the Z-order changes while it is walked.
+    for _ in 0..100_000 {
+        // SAFETY: GetWindow validates the handle; it returns null at the
+        // bottom of the Z-order or for a stale handle.
+        hwnd = unsafe { GetWindow(hwnd, GW_HWNDNEXT) };
+        if hwnd.is_null() {
+            return false;
+        }
+        if hwnd as usize == lower.0 {
+            return true;
+        }
+    }
+    false
+}
+
 /// A top-level window, as seen from outside its process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WindowInfo {

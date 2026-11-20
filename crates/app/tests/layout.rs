@@ -101,8 +101,9 @@ fn draw(window: &MinimalSoftwareWindow, w: f32, h: f32, name: &str) {
 
 /// Renders the layouts in the dark colour scheme (snapshots only). Here,
 /// controls that exist when the scheme changes may keep some colours of the
-/// old one, so every rendering follows a layout switch, which recreates them
-/// (the application gets its scheme before the window is first drawn).
+/// old one (the application gets its scheme before the window is first
+/// drawn). Every rendering follows a layout switch, which recreates most of
+/// them; the status panel, shared by both layouts, may still show some.
 fn render_dark(window: &MinimalSoftwareWindow, ui: &MainWindow) {
     ui.global::<Palette>().set_color_scheme(ColorScheme::Dark);
     for (compact, overlay, name) in [

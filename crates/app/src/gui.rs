@@ -128,6 +128,9 @@ struct Controller {
     /// The window is being widened for the full layout; its height is fitted
     /// once it has the new width (see [`Controller::toggle_compact`]).
     fit_height: Cell<bool>,
+    /// The About window was open when this window was hidden to the tray: it
+    /// comes back with it.
+    about_hidden_with_window: Cell<bool>,
     log_dir: Option<PathBuf>,
     shutdown_signal: ShutdownSignal,
 }
@@ -312,6 +315,7 @@ impl App {
             overlay_active: Cell::new(false),
             full_size: Cell::new(None),
             fit_height: Cell::new(false),
+            about_hidden_with_window: Cell::new(false),
             log_dir: options.log_dir,
             shutdown_signal: Arc::new((Mutex::new(false), Condvar::new())),
         });
@@ -1142,6 +1146,18 @@ impl Controller {
             tray.set_window_visible(true);
         }
         activate_own_window(form::APP_NAME);
+        // An About window hidden with this window comes back, over it.
+        if self.about_hidden_with_window.take() {
+            let about = self
+                .about
+                .borrow()
+                .as_ref()
+                .map(ComponentHandle::clone_strong);
+            if let Some(about) = about {
+                center_dialog(&ui, &about);
+                let _ = about.show();
+            }
+        }
     }
 
     /// Hides the window to the notification area. Clicking, hotkeys and the
@@ -1156,8 +1172,13 @@ impl Controller {
             self.end_capture();
         }
         self.cancel_pick();
-        // The About window belongs to this window: it goes with it.
-        if let Some(about) = self.about.borrow().as_ref() {
+        // The About window belongs to this window: it goes with it and comes
+        // back with it (see `show_window`). The flag is only set here, so
+        // hiding an already hidden window keeps it.
+        if let Some(about) = self.about.borrow().as_ref()
+            && about.window().is_visible()
+        {
+            self.about_hidden_with_window.set(true);
             let _ = about.hide();
         }
         self.with_ui(|ui| {
@@ -1403,6 +1424,11 @@ thread_local! {
 /// owned window of [`DIALOG_OWNER`] while that is set: a native Win32 owner
 /// relationship, set when the window is created. Once per process; if a
 /// backend was already chosen, the About window is simply not owned.
+///
+/// Windows keeps an owned window above its owner (also when the owner is
+/// activated or clicked), hides it while the owner is minimized, and keeps it
+/// on the owner's level: always on top exactly while the main window is
+/// (Always on top, overlay mode), never on its own.
 ///
 /// Limitation: the owner is applied only when the native window is created.
 /// Slint 1.18.1 destroys and later re-creates the native window of a hidden

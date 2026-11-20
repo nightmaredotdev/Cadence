@@ -595,6 +595,73 @@ component WindowActions inherits HorizontalLayout {
     }
 }
 
+// The status, the main action and the window actions, in one card: the top
+// of the full layout, and the whole compact one, which adds a line under the
+// headline saying where and how often Cadence clicks (or a notice or an
+// error, in its place). The same component and metrics in both layouts.
+component StatusPanel inherits Rectangle {
+    in property <RunStatus> status;
+    in property <string> headline;
+    in property <string> toggle-key;
+    in property <bool> compact;
+    in property <bool> overlay-active;
+    in property <string> overlay-key;
+    /// The line under the headline (compact layout).
+    in property <string> detail;
+    in property <color> detail-color: Theme.muted;
+    /// An error, shown as a message under the status (full layout).
+    in property <string> error;
+    callback start-stop();
+    callback overlay-clicked();
+    callback layout-clicked();
+    background: Palette.alternate-background;
+    border-radius: Theme.card-radius;
+    border-width: 1px;
+    border-color: Palette.border.transparentize(40%);
+    VerticalLayout {
+        padding: 1px;
+        VerticalLayout {
+            padding: 10px;
+            padding-left: Theme.card-padding - 1px;
+            padding-right: Theme.card-padding - 1px;
+            spacing: root.compact ? 6px : 8px;
+            StatusRow {
+                status: root.status;
+                headline: root.headline;
+                toggle-key: root.toggle-key;
+                start-stop => { root.start-stop(); }
+            }
+            // Under the headline (dot 20 px + spacing 12 px); a fixed height,
+            // so the compact window is always exactly as tall.
+            if root.detail != "": HorizontalLayout {
+                padding-left: 32px;
+                Text {
+                    text: root.detail;
+                    height: 17px;
+                    font-size: Theme.caption-size;
+                    color: root.detail-color;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+            if root.error != "": Message { text: root.error; }
+        }
+        Rectangle {
+            height: 1px;
+            background: Theme.divider;
+        }
+        WindowActions {
+            vertical-padding: 2px;
+            horizontal-padding: 5px;
+            compact: root.compact;
+            overlay-active: root.overlay-active;
+            overlay-key: root.overlay-key;
+            overlay-clicked => { root.overlay-clicked(); }
+            layout-clicked => { root.layout-clicked(); }
+        }
+    }
+}
+
 export component AboutWindow inherits Window {
     in property <string> version;
     callback close-clicked();
@@ -800,120 +867,46 @@ export component MainWindow inherits Window {
     // layout's parts are created only while it is shown, so neither has
     // hidden controls (or hidden keyboard stops).
     main-layout := VerticalLayout {
-        padding: root.compact-mode ? 0px : 14px;
-        spacing: root.compact-mode ? 0px : Theme.gap;
+        padding: 14px;
+        spacing: Theme.gap;
 
-        if root.config-warning != "": VerticalLayout {
-            padding: root.compact-mode ? 10px : 0px;
-            Message {
-                text: root.config-warning;
-                tone: Theme.waiting;
-                dismissable: true;
-                dismissed => { root.warning-dismissed(); }
+        if root.config-warning != "": Message {
+            text: root.config-warning;
+            tone: Theme.waiting;
+            dismissable: true;
+            dismissed => { root.warning-dismissed(); }
+        }
+
+        // ---- status, main action and window actions ----
+        // One panel in both layouts. The full layout shows an error as a
+        // message in it (and notices below it); the compact layout, which
+        // has no settings, a line saying where and how often Cadence clicks,
+        // with an error or a notice in its place, so its size never changes:
+        // 14 + 114 + 14 = exactly the 142 px of the compact window.
+        StatusPanel {
+            status: root.status;
+            headline: root.status-headline;
+            toggle-key: root.toggle-key;
+            compact: root.compact-mode;
+            overlay-active: root.overlay-active;
+            overlay-key: root.overlay-key;
+            detail: !root.compact-mode ? ""
+                : root.error-text != "" ? root.error-text
+                : root.notice-text != "" ? root.notice-text : root.summary-text;
+            detail-color: root.error-text != "" ? Theme.error
+                : root.notice-text != "" ? Palette.foreground : Theme.muted;
+            error: root.compact-mode ? "" : root.error-text;
+            start-stop => { root.start-stop-clicked(); }
+            overlay-clicked => {
+                root.release-field-focus();
+                root.overlay-clicked();
+            }
+            layout-clicked => {
+                root.release-field-focus();
+                root.compact-toggled();
             }
         }
 
-        // ---- full layout: status, main action and window actions ----
-        // The same panel as the compact layout: the window actions in a strip
-        // below the status, clearly apart from the tabs further down.
-        if !root.compact-mode: Rectangle {
-            background: Palette.alternate-background;
-            border-radius: Theme.card-radius;
-            border-width: 1px;
-            border-color: Palette.border.transparentize(40%);
-            VerticalLayout {
-                padding: 1px;
-                VerticalLayout {
-                    padding: 10px;
-                    padding-left: Theme.card-padding - 1px;
-                    padding-right: Theme.card-padding - 1px;
-                    spacing: 8px;
-                    StatusRow {
-                        status: root.status;
-                        headline: root.status-headline;
-                        toggle-key: root.toggle-key;
-                        start-stop => { root.start-stop-clicked(); }
-                    }
-                    if root.error-text != "": Message { text: root.error-text; }
-                }
-                Rectangle {
-                    height: 1px;
-                    background: Theme.divider;
-                }
-                WindowActions {
-                    vertical-padding: 2px;
-                    horizontal-padding: 5px;
-                    compact: false;
-                    overlay-active: root.overlay-active;
-                    overlay-key: root.overlay-key;
-                    overlay-clicked => {
-                        root.release-field-focus();
-                        root.overlay-clicked();
-                    }
-                    layout-clicked => {
-                        root.release-field-focus();
-                        root.compact-toggled();
-                    }
-                }
-            }
-        }
-
-        // ---- compact layout: one panel ----
-        // The status and Start/Stop on top, with a line saying where and how
-        // often Cadence clicks; the view buttons in a strip below. 101 + 1 +
-        // 40 px: exactly as tall as the 142 px compact window.
-        if root.compact-mode: VerticalLayout {
-            Rectangle {
-                height: 101px;
-                VerticalLayout {
-                    padding-left: 16px;
-                    padding-right: 16px;
-                    alignment: center;
-                    spacing: 4px;
-                    StatusRow {
-                        status: root.status;
-                        headline: root.status-headline;
-                        toggle-key: root.toggle-key;
-                        headline-size: 18px;
-                        button-width: 112px;
-                        start-stop => { root.start-stop-clicked(); }
-                    }
-                    // Under the headline (dot 20 px + spacing 12 px). An error
-                    // or a notice (e.g. Start without a position) takes the
-                    // summary's place, so the window keeps its size.
-                    HorizontalLayout {
-                        padding-left: 32px;
-                        Text {
-                            text: root.error-text != "" ? root.error-text
-                                : root.notice-text != "" ? root.notice-text : root.summary-text;
-                            font-size: Theme.caption-size;
-                            color: root.error-text != "" ? Theme.error
-                                : root.notice-text != "" ? Palette.foreground : Theme.muted;
-                            overflow: elide;
-                        }
-                    }
-                }
-            }
-            Rectangle {
-                height: 1px;
-                background: Theme.divider;
-            }
-            // The same height with the overlay hint as with the buttons, so
-            // turning overlay mode on or off never resizes the window.
-            Rectangle {
-                height: 40px;
-                background: Palette.alternate-background;
-                WindowActions {
-                    vertical-padding: 4px;
-                    horizontal-padding: 6px;
-                    compact: true;
-                    overlay-active: root.overlay-active;
-                    overlay-key: root.overlay-key;
-                    overlay-clicked => { root.overlay-clicked(); }
-                    layout-clicked => { root.compact-toggled(); }
-                }
-            }
-        }
         // Problem notices (e.g. Start without a position), below the status
         // card. The line only exists while there is a notice; no space is
         // reserved for it otherwise.

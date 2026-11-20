@@ -35,7 +35,7 @@ mod imp {
     use cadence_platform::diagnostics::{
         HookEvent, MouseHookRecorder, TestWindow, WindowInfo, WindowKind, click_unmarked,
         click_unmarked_button, client_rect, cursor_position, force_foreground, foreground_window,
-        monitors, post_close, send_keys, window_at, windows_of_process, work_area_of,
+        is_above, monitors, post_close, send_keys, window_at, windows_of_process, work_area_of,
     };
     use cadence_platform::{HotkeyService, WindowsInput};
     use slint::{ComponentHandle, LogicalSize, Model, Timer, TimerMode};
@@ -1678,6 +1678,18 @@ mod imp {
         );
     }
 
+    /// About above its owner in the Z-order and in front of it, always on
+    /// top exactly when the main window is (Windows keeps an owned window in
+    /// its owner's band), never on its own.
+    fn about_above_main(topmost: bool) {
+        let (main, about) = (main_window("Cadence"), about_window().unwrap());
+        assert_eq!(about.owner, Some(main.id), "owned by the main window");
+        assert!(is_above(about.id, main.id), "About above the main window");
+        assert_eq!(main.topmost, topmost, "the main window's level");
+        assert_eq!(about.topmost, topmost, "About on its owner's level");
+        about_on_top(&about);
+    }
+
     fn about_is_an_owned_dialog_centred_over_the_window(dir: &Path) {
         let path = dir.join("about.toml");
         let mut cfg = initial_config();
@@ -1717,6 +1729,92 @@ mod imp {
             steps.extend(open_about(a, &state, 1));
             steps.extend(close_about(&state));
         }
+
+        steps.push(Step::Say(
+            "about: stays above the main window when it is activated; not always on top",
+        ));
+        steps.extend(open_about(a, &state, 1));
+        steps.push(act(|| {
+            assert!(
+                force_foreground(main_window("Cadence").id),
+                "the main window activated"
+            )
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| about_above_main(false)));
+
+        steps.push(Step::Say(
+            "about: another application's window covers both About and the main window",
+        ));
+        let other: Rc<RefCell<Option<TestWindow>>> = Rc::default();
+        steps.push(act({
+            let other = other.clone();
+            move || {
+                let r = main_window("Cadence").rect;
+                let r = Rect::new(r.left - 20, r.top - 20, r.right + 20, r.bottom + 20);
+                let window = TestWindow::create(r, WindowKind::Normal, "unrelated").unwrap();
+                assert!(window.bring_to_foreground(), "the other window activated");
+                *other.borrow_mut() = Some(window);
+            }
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act({
+            let other = other.clone();
+            move || {
+                let id = other.borrow().as_ref().unwrap().id();
+                let (main, about) = (main_window("Cadence"), about_window().unwrap());
+                assert!(is_above(id, about.id), "the other window covers About");
+                assert!(
+                    is_above(id, main.id),
+                    "the other window covers the main window"
+                );
+                assert!(is_above(about.id, main.id), "About still above its owner");
+                let r = about.rect;
+                let center = Point::new((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+                assert_eq!(window_at(center), id, "the other window is in front");
+            }
+        }));
+        steps.push(act({
+            let other = other.clone();
+            move || {
+                drop(other.borrow_mut().take());
+                assert!(
+                    force_foreground(main_window("Cadence").id),
+                    "the main window activated again"
+                );
+            }
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| about_above_main(false)));
+
+        steps.push(Step::Say(
+            "about: above the main window while it is always on top, and after",
+        ));
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                app.ui().set_keep_on_top(true);
+                app.ui().invoke_keep_on_top_toggled(true);
+            }
+        }));
+        steps.push(wait_for("the main window always on top", || {
+            main_window("Cadence").topmost
+        }));
+        steps.push(settle(Duration::from_millis(200)));
+        steps.push(act(|| about_above_main(true)));
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                app.ui().set_keep_on_top(false);
+                app.ui().invoke_keep_on_top_toggled(false);
+            }
+        }));
+        steps.push(wait_for("the main window not always on top", || {
+            !main_window("Cadence").topmost
+        }));
+        steps.push(settle(Duration::from_millis(200)));
+        steps.push(act(|| about_above_main(false)));
+        steps.extend(close_about(&state));
 
         steps.push(Step::Say(
             "about: follows the main window when it moves and is resized",
@@ -1903,7 +2001,7 @@ mod imp {
         steps.extend(close_about(&state));
 
         steps.push(Step::Say(
-            "about: hiding the main window to the tray hides About too",
+            "about: hidden with the main window to the tray, back with it when shown",
         ));
         steps.extend(open_about(a, &state, 1));
         steps.push(act(|| {
@@ -1917,13 +2015,45 @@ mod imp {
             let app = app.clone();
             move || app.tray().unwrap().invoke_show_window()
         }));
-        steps.push(wait_for("the main window shown again", {
+        steps.push(wait_for("the main window and About shown again", {
+            let app = app.clone();
+            move || app.window_visible() && about_window().is_some()
+        }));
+        steps.push(wait_for("About centred again", about_centred));
+        steps.push(act({
+            let state = state.clone();
+            move || {
+                let about = about_window().unwrap();
+                assert_eq!(about.owner, Some(main_window("Cadence").id));
+                assert_eq!(
+                    Some(about.id),
+                    state.borrow().about,
+                    "the same About window"
+                );
+                about_on_top(&about);
+            }
+        }));
+        steps.push(record_main(&state));
+        steps.extend(close_about(&state));
+        // Closed by the user: it stays closed when the window comes back.
+        steps.push(act(|| {
+            assert!(post_close(main_window("Cadence").id), "WM_CLOSE posted")
+        }));
+        steps.push(wait_for("hidden", {
+            let app = app.clone();
+            move || !app.window_visible()
+        }));
+        steps.push(act({
+            let app = app.clone();
+            move || app.tray().unwrap().invoke_show_window()
+        }));
+        steps.push(wait_for("shown", {
             let app = app.clone();
             move || app.window_visible()
         }));
         steps.push(settle(Duration::from_millis(300)));
         steps.push(act(|| {
-            assert!(about_window().is_none(), "About stays closed")
+            assert!(about_window().is_none(), "a closed About stays closed")
         }));
         steps.push(record_main(&state));
         steps.extend(open_about(a, &state, 1));
