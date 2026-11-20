@@ -595,10 +595,11 @@ component WindowActions inherits HorizontalLayout {
     }
 }
 
-// The status, the main action and the window actions, in one card: the top
-// of the full layout, and the whole compact one, which adds a line under the
-// headline saying where and how often Cadence clicks (or a notice or an
-// error, in its place). The same component and metrics in both layouts.
+// The status, the main action and the window actions, in one card at the
+// top of both layouts: the same component, metrics and size in both (only
+// its width follows the window's). Nothing in it depends on the layout but
+// the label of the layout button; an error grows it in the full layout only
+// (the compact layout shows it in the line below the card instead).
 component StatusPanel inherits Rectangle {
     in property <RunStatus> status;
     in property <string> headline;
@@ -606,9 +607,6 @@ component StatusPanel inherits Rectangle {
     in property <bool> compact;
     in property <bool> overlay-active;
     in property <string> overlay-key;
-    /// The line under the headline (compact layout).
-    in property <string> detail;
-    in property <color> detail-color: Theme.muted;
     /// An error, shown as a message under the status (full layout).
     in property <string> error;
     callback start-stop();
@@ -624,25 +622,12 @@ component StatusPanel inherits Rectangle {
             padding: 10px;
             padding-left: Theme.card-padding - 1px;
             padding-right: Theme.card-padding - 1px;
-            spacing: root.compact ? 6px : 8px;
+            spacing: 8px;
             StatusRow {
                 status: root.status;
                 headline: root.headline;
                 toggle-key: root.toggle-key;
                 start-stop => { root.start-stop(); }
-            }
-            // Under the headline (dot 20 px + spacing 12 px); a fixed height,
-            // so the compact window is always exactly as tall.
-            if root.detail != "": HorizontalLayout {
-                padding-left: 32px;
-                Text {
-                    text: root.detail;
-                    height: 17px;
-                    font-size: Theme.caption-size;
-                    color: root.detail-color;
-                    vertical-alignment: center;
-                    overflow: elide;
-                }
             }
             if root.error != "": Message { text: root.error; }
         }
@@ -665,8 +650,8 @@ component StatusPanel inherits Rectangle {
 export component AboutWindow inherits Window {
     in property <string> version;
     callback close-clicked();
-    /// The size the window opens at (read by Rust to centre it over the
-    /// main window before it is first shown).
+    /// The size the window opens at (read by Rust to place it beside the
+    /// main window before it is shown).
     out property <length> layout-preferred-width: 380px;
     out property <length> layout-preferred-height: about-layout.preferred-height;
     title: "About Cadence";
@@ -800,6 +785,11 @@ export component MainWindow inherits Window {
     /// layout changes (read by Rust).
     out property <length> layout-preferred-width: root.compact-mode ? 360px : 420px;
     out property <length> layout-preferred-height: main-layout.preferred-height;
+    /// The status panel's bounds in the window (checked by the layout test).
+    out property <length> status-panel-x: status-panel.absolute-position.x;
+    out property <length> status-panel-y: status-panel.absolute-position.y;
+    out property <length> status-panel-width: status-panel.width;
+    out property <length> status-panel-height: status-panel.height;
 
     // The Interval field only exists in the full layout, so it is focused
     // through this counter rather than by its id.
@@ -868,6 +858,8 @@ export component MainWindow inherits Window {
     // hidden controls (or hidden keyboard stops).
     main-layout := VerticalLayout {
         padding: 14px;
+        // The compact layout's last line has 2-3 px of space inside it.
+        padding-bottom: root.compact-mode ? 10px : 14px;
         spacing: Theme.gap;
 
         if root.config-warning != "": Message {
@@ -878,23 +870,16 @@ export component MainWindow inherits Window {
         }
 
         // ---- status, main action and window actions ----
-        // One panel in both layouts. The full layout shows an error as a
-        // message in it (and notices below it); the compact layout, which
-        // has no settings, a line saying where and how often Cadence clicks,
-        // with an error or a notice in its place, so its size never changes:
-        // 14 + 114 + 14 = exactly the 142 px of the compact window.
-        StatusPanel {
+        // The same panel, 91 px tall, in both layouts. The full layout shows
+        // an error as a message in it, and notices below it; the compact
+        // layout a line below it instead (see there).
+        status-panel := StatusPanel {
             status: root.status;
             headline: root.status-headline;
             toggle-key: root.toggle-key;
             compact: root.compact-mode;
             overlay-active: root.overlay-active;
             overlay-key: root.overlay-key;
-            detail: !root.compact-mode ? ""
-                : root.error-text != "" ? root.error-text
-                : root.notice-text != "" ? root.notice-text : root.summary-text;
-            detail-color: root.error-text != "" ? Theme.error
-                : root.notice-text != "" ? Palette.foreground : Theme.muted;
             error: root.compact-mode ? "" : root.error-text;
             start-stop => { root.start-stop-clicked(); }
             overlay-clicked => {
@@ -905,6 +890,22 @@ export component MainWindow inherits Window {
                 root.release-field-focus();
                 root.compact-toggled();
             }
+        }
+
+        // Compact layout: a line below the panel saying where and how often
+        // Cadence clicks, with an error or a notice (e.g. Start without a
+        // position) in its place, so the window never changes size:
+        // 14 + 91 + 10 + 17 + 10 = exactly the 142 px of the compact window.
+        if root.compact-mode: Text {
+            height: 17px;
+            text: root.error-text != "" ? root.error-text
+                : root.notice-text != "" ? root.notice-text : root.summary-text;
+            color: root.error-text != "" ? Theme.error
+                : root.notice-text != "" ? Palette.foreground : Theme.muted;
+            font-size: Theme.caption-size;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+            overflow: elide;
         }
 
         // Problem notices (e.g. Start without a position), below the status

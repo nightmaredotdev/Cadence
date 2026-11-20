@@ -537,6 +537,26 @@ pub fn window_at(p: Point) -> WindowId {
     WindowId(hwnd as usize)
 }
 
+/// Moves `window` so its top-left corner (frame included) is at `p`, keeping
+/// its size, Z-order and activation: as when the user drags it.
+pub fn move_window(window: WindowId, p: Point) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    };
+    // SAFETY: SetWindowPos validates the handle; a stale one just fails.
+    unsafe {
+        SetWindowPos(
+            window.0 as HWND,
+            std::ptr::null_mut(),
+            p.x,
+            p.y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        ) != 0
+    }
+}
+
 /// Whether top-level window `upper` is above `lower` in the Z-order (false
 /// if either is not a top-level window or they are the same window).
 pub fn is_above(upper: WindowId, lower: WindowId) -> bool {

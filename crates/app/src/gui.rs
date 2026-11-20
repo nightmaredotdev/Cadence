@@ -39,10 +39,9 @@ use cadence_platform::{
     set_window_opacity, window_overlay_styles,
 };
 use log::{error, info, warn};
-use slint::winit_030::winit::event::WindowEvent as WinitEvent;
+use slint::winit_030::WinitWindowAccessor;
 use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows;
 use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{
     CloseRequestResponse, ComponentHandle, LogicalSize, ModelRc, PhysicalPosition, SharedString,
     Timer, VecModel,
@@ -474,16 +473,6 @@ impl Controller {
             .toggle_overlay(OverlaySource::Window));
         on!(on_overlay_hotkey, |c| c
             .toggle_overlay(OverlaySource::Hotkey));
-
-        let weak = Rc::downgrade(this);
-        ui.window().on_winit_window_event(move |_, event| {
-            if matches!(event, WinitEvent::Moved(_) | WinitEvent::Resized(_))
-                && let Some(c) = weak.upgrade()
-            {
-                c.follow_main_window();
-            }
-            EventResult::Propagate
-        });
 
         let weak = Rc::downgrade(this);
         ui.window().on_close_requested(move || {
@@ -1070,7 +1059,9 @@ impl Controller {
 
     /// Shows the About window: an owned window of the main window (it stays
     /// above it, is hidden with it when minimized and has no taskbar button
-    /// of its own), centred over it.
+    /// of its own) with a position of its own. Each opening places it beside
+    /// the main window; after that it stays where it is (or where the user
+    /// moves it) whatever the main window does.
     fn show_about(&self) {
         self.commit_pending_edits();
         let Some(ui) = self.ui.upgrade() else { return };
@@ -1105,24 +1096,11 @@ impl Controller {
             about.as_ref().map(ComponentHandle::clone_strong)
         };
         let Some(window) = window else { return };
-        center_dialog(&ui, &window);
+        // Already open: it keeps its position.
+        if !window.window().is_visible() {
+            place_dialog(&ui, &window);
+        }
         let _ = window.show();
-    }
-
-    /// Keeps an open About window centred when this window moves or resizes.
-    fn follow_main_window(&self) {
-        let Some(ui) = self.ui.upgrade() else { return };
-        if !self.window_visible.get() {
-            return;
-        }
-        let about = self
-            .about
-            .borrow()
-            .as_ref()
-            .map(ComponentHandle::clone_strong);
-        if let Some(about) = about.filter(|a| a.window().is_visible()) {
-            center_dialog(&ui, &about);
-        }
     }
 
     /// Shows the window and brings it to the front (tray, tray icon, another
@@ -1146,7 +1124,8 @@ impl Controller {
             tray.set_window_visible(true);
         }
         activate_own_window(form::APP_NAME);
-        // An About window hidden with this window comes back, over it.
+        // An About window hidden with this window comes back with it, where
+        // it was (showing a window again does not move it).
         if self.about_hidden_with_window.take() {
             let about = self
                 .about
@@ -1154,7 +1133,6 @@ impl Controller {
                 .as_ref()
                 .map(ComponentHandle::clone_strong);
             if let Some(about) = about {
-                center_dialog(&ui, &about);
                 let _ = about.show();
             }
         }
@@ -1428,7 +1406,9 @@ thread_local! {
 /// Windows keeps an owned window above its owner (also when the owner is
 /// activated or clicked), hides it while the owner is minimized, and keeps it
 /// on the owner's level: always on top exactly while the main window is
-/// (Always on top, overlay mode), never on its own.
+/// (Always on top, overlay mode), never on its own. Ownership is about
+/// Z-order only: the owned window keeps its own position (see
+/// [`place_dialog`]).
 ///
 /// Limitation: the owner is applied only when the native window is created.
 /// Slint 1.18.1 destroys and later re-creates the native window of a hidden
@@ -1438,7 +1418,7 @@ thread_local! {
 /// be an ordinary, independent window (still working, only not owned).
 /// Cadence keeps the event loop running until it exits, so the About window
 /// is created once and stays owned. A Slint upgrade must check this again
-/// (the GUI test `about_is_an_owned_dialog_centred_over_the_window` reopens
+/// (the GUI test `about_is_an_owned_dialog_with_its_own_position` reopens
 /// About in one running event loop and fails if the window is re-created).
 fn select_backend() {
     static SELECTED: std::sync::Once = std::sync::Once::new();
@@ -1456,9 +1436,10 @@ fn select_backend() {
     });
 }
 
-/// Centres `about` over the main window, inside the work area of its
-/// monitor. Does nothing while the main window is minimized.
-fn center_dialog(ui: &MainWindow, about: &AboutWindow) {
+/// Places `about` beside the main window (see [`dialog::beside`]), inside the
+/// work area of its monitor. Only when About is opened: nothing moves it
+/// afterwards. Does nothing while the main window is minimized.
+fn place_dialog(ui: &MainWindow, about: &AboutWindow) {
     let owner = ui.window().with_winit_window(|w| {
         let pos = w.outer_position().ok()?;
         let (outer, inner) = (w.outer_size(), w.inner_size());
@@ -1503,7 +1484,8 @@ fn center_dialog(ui: &MainWindow, about: &AboutWindow) {
         .hwnd()
         .ok()
         .and_then(|h| monitor_work_area(h).ok());
-    let p = dialog::centered_over(owner, size, work);
+    let gap = (dialog::GAP * ui.window().scale_factor()).round() as i32;
+    let p = dialog::beside(owner, size, work, gap);
     about.window().set_position(PhysicalPosition::new(p.x, p.y));
 }
 

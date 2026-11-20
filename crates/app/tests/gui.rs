@@ -35,7 +35,8 @@ mod imp {
     use cadence_platform::diagnostics::{
         HookEvent, MouseHookRecorder, TestWindow, WindowInfo, WindowKind, click_unmarked,
         click_unmarked_button, client_rect, cursor_position, force_foreground, foreground_window,
-        is_above, monitors, post_close, send_keys, window_at, windows_of_process, work_area_of,
+        is_above, monitors, move_window, post_close, send_keys, window_at, windows_of_process,
+        work_area_of,
     };
     use cadence_platform::{HotkeyService, WindowsInput};
     use slint::{ComponentHandle, LogicalSize, Model, Timer, TimerMode};
@@ -247,7 +248,7 @@ mod imp {
         second_session(&path);
         compact_and_overlay_session(&dir, &recorder);
         overlay_needs_an_available_hotkey(&dir);
-        about_is_an_owned_dialog_centred_over_the_window(&dir);
+        about_is_an_owned_dialog_with_its_own_position(&dir);
         startup_conflict_is_shown(&dir);
         obsolete_start_stop_bindings_are_migrated(&dir);
         corrupt_settings_are_reported(&dir);
@@ -1462,10 +1463,20 @@ mod imp {
         (r.right - r.left, r.bottom - r.top)
     }
 
-    /// Where the About window belongs: centred over `main`, inside the work
-    /// area of its monitor.
-    fn expected_about(main: &WindowInfo, about: &WindowInfo) -> Point {
-        cadence::dialog::centered_over(main.rect, size_of_rect(about.rect), work_area_of(main.id))
+    /// Where the About window opens: beside `main`, inside the work area of
+    /// its monitor.
+    fn expected_about(main: &WindowInfo, about: &WindowInfo, scale: f32) -> Point {
+        let gap = (cadence::dialog::GAP * scale).round() as i32;
+        cadence::dialog::beside(
+            main.rect,
+            size_of_rect(about.rect),
+            work_area_of(main.id),
+            gap,
+        )
+    }
+
+    fn overlap(a: Rect, b: Rect) -> bool {
+        a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
     }
 
     fn near(a: Point, b: Point, tolerance: i32) -> bool {
@@ -1596,6 +1607,60 @@ mod imp {
         about: Option<cadence_platform::diagnostics::WindowId>,
         /// The main window's rectangle before About was opened.
         main: Option<Rect>,
+        /// About's own rectangle, recorded to check that it stays there.
+        about_rect: Option<Rect>,
+    }
+
+    fn record_about(state: &Rc<RefCell<AboutRun>>) -> Step {
+        let state = state.clone();
+        act(move || state.borrow_mut().about_rect = Some(about_window().unwrap().rect))
+    }
+
+    /// About is open at the position recorded by [`record_about`], however
+    /// the main window moved, resized or was hidden and shown meanwhile.
+    fn about_stayed(state: &Rc<RefCell<AboutRun>>, what: &'static str) -> Step {
+        let state = state.clone();
+        act(move || {
+            let about = about_window().expect("About open");
+            assert_eq!(
+                Some(about.rect),
+                state.borrow().about_rect,
+                "About kept its own position: {what}"
+            );
+        })
+    }
+
+    /// Moves About as the user would by dragging it, by (`dx`, `dy`), and
+    /// checks that the main window stays put.
+    fn drag_about(state: &Rc<RefCell<AboutRun>>, dx: i32, dy: i32) -> Vec<Step> {
+        let target = Rc::new(std::cell::Cell::new(Point::new(0, 0)));
+        vec![
+            record_main(state),
+            act({
+                let target = target.clone();
+                move || {
+                    let r = about_window().unwrap().rect;
+                    target.set(Point::new(r.left + dx, r.top + dy));
+                    assert!(move_window(about_window().unwrap().id, target.get()));
+                }
+            }),
+            wait_for("About moved", move || {
+                about_window().is_some_and(|a| Point::new(a.rect.left, a.rect.top) == target.get())
+            }),
+            settle(Duration::from_millis(250)),
+            act({
+                let state = state.clone();
+                move || {
+                    let expected = state.borrow().main.expect("recorded");
+                    assert_eq!(
+                        main_window("Cadence").rect,
+                        expected,
+                        "moving About does not move the main window"
+                    );
+                }
+            }),
+            record_about(state),
+        ]
     }
 
     fn record_main(state: &Rc<RefCell<AboutRun>>) -> Step {
@@ -1604,10 +1669,11 @@ mod imp {
     }
 
     /// Opens About and checks it: owned by the main window, the same native
-    /// window as at its first opening, centred over the main window. The
-    /// first position is set before the window exists, from its expected
-    /// size, so a few pixels of frame difference are allowed then.
+    /// window as at its first opening, beside the main window and not over
+    /// it. The first position is set before the window exists, from its
+    /// expected size, so a few pixels of frame difference are allowed then.
     fn open_about(app: &Rc<App>, state: &Rc<RefCell<AboutRun>>, tolerance: i32) -> Vec<Step> {
+        let scale = app.ui().window().scale_factor();
         let (app, state) = (app.clone(), state.clone());
         vec![
             act(move || app.ui().invoke_about_clicked()),
@@ -1626,11 +1692,18 @@ mod imp {
                     ),
                 }
                 let at = Point::new(about.rect.left, about.rect.top);
-                let expected = expected_about(&main, &about);
+                let expected = expected_about(&main, &about, scale);
                 assert!(
                     near(at, expected, tolerance),
                     "About at {at}, expected {expected}"
                 );
+                assert!(
+                    !overlap(about.rect, main.rect),
+                    "About opens beside the main window, not over it: {:?} / {:?}",
+                    about.rect,
+                    main.rect
+                );
+                state.about_rect = Some(about.rect);
             }),
         ]
     }
@@ -1651,20 +1724,6 @@ mod imp {
                 );
             }),
         ]
-    }
-
-    fn about_centred() -> bool {
-        match (
-            about_window(),
-            own_windows()
-                .into_iter()
-                .find(|w| w.visible && w.title.starts_with("Cadence")),
-        ) {
-            (Some(about), Some(main)) => {
-                Point::new(about.rect.left, about.rect.top) == expected_about(&main, &about)
-            }
-            _ => false,
-        }
     }
 
     /// About above the main window, taking the mouse at its centre.
@@ -1690,7 +1749,7 @@ mod imp {
         about_on_top(&about);
     }
 
-    fn about_is_an_owned_dialog_centred_over_the_window(dir: &Path) {
+    fn about_is_an_owned_dialog_with_its_own_position(dir: &Path) {
         let path = dir.join("about.toml");
         let mut cfg = initial_config();
         cfg.click.mode = TargetMode::Cursor;
@@ -1702,7 +1761,7 @@ mod imp {
         let a = &app;
         let mut steps = vec![
             Step::Say(
-                "about (in one event loop): the first opening creates an owned, centred window",
+                "about (in one event loop): the first opening creates an owned window beside the main window",
             ),
             wait_for("the main window", || {
                 own_windows()
@@ -1750,8 +1809,14 @@ mod imp {
         steps.push(act({
             let other = other.clone();
             move || {
-                let r = main_window("Cadence").rect;
-                let r = Rect::new(r.left - 20, r.top - 20, r.right + 20, r.bottom + 20);
+                // Over both windows (About is beside the main window).
+                let (m, a) = (main_window("Cadence").rect, about_window().unwrap().rect);
+                let r = Rect::new(
+                    m.left.min(a.left) - 20,
+                    m.top.min(a.top) - 20,
+                    m.right.max(a.right) + 20,
+                    m.bottom.max(a.bottom) + 20,
+                );
                 let window = TestWindow::create(r, WindowKind::Normal, "unrelated").unwrap();
                 assert!(window.bring_to_foreground(), "the other window activated");
                 *other.borrow_mut() = Some(window);
@@ -1817,7 +1882,7 @@ mod imp {
         steps.extend(close_about(&state));
 
         steps.push(Step::Say(
-            "about: follows the main window when it moves and is resized",
+            "about: keeps its own position when the main window moves and is resized",
         ));
         steps.extend(open_about(a, &state, 1));
         let moved = Rc::new(std::cell::Cell::new(0));
@@ -1834,7 +1899,8 @@ mod imp {
         steps.push(wait_for("the main window moved", move || {
             main_window("Cadence").rect.left == moved.get()
         }));
-        steps.push(wait_for("About centred after the move", about_centred));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(about_stayed(&state, "the main window moved"));
         let wider = Rc::new(std::cell::Cell::new(0));
         steps.push(act({
             let (app, wider) = (app.clone(), wider.clone());
@@ -1851,7 +1917,24 @@ mod imp {
         steps.push(wait_for("the main window resized", move || {
             size_of_rect(main_window("Cadence").rect).0 > wider.get()
         }));
-        steps.push(wait_for("About centred after the resize", about_centred));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(about_stayed(&state, "the main window resized"));
+        // Now overlapping the moved and widened main window: still above it.
+        steps.push(act(|| about_above_main(false)));
+
+        steps.push(Step::Say(
+            "about: moved on its own, the main window stays put; still above it",
+        ));
+        steps.extend(drag_about(&state, -160, 70));
+        steps.push(act(|| {
+            assert!(
+                force_foreground(main_window("Cadence").id),
+                "the main window activated"
+            )
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| about_above_main(false)));
+        steps.push(about_stayed(&state, "the main window activated"));
 
         steps.push(Step::Say(
             "about: hidden with the minimized main window, back when restored",
@@ -1868,7 +1951,11 @@ mod imp {
             move || app.ui().window().set_minimized(false)
         }));
         steps.push(wait_for("About back", || about_window().is_some()));
-        steps.push(wait_for("About centred after restoring", about_centred));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(about_stayed(
+            &state,
+            "the main window minimized and restored",
+        ));
         steps.push(act({
             let state = state.clone();
             move || {
@@ -1891,6 +1978,7 @@ mod imp {
         ));
         for _ in 0..3 {
             steps.extend(open_about(a, &state, 1));
+            steps.push(record_about(&state));
             steps.push(act({
                 let app = app.clone();
                 move || app.ui().invoke_compact_toggled()
@@ -1901,10 +1989,8 @@ mod imp {
                     app.ui().get_compact_mode() && size_of_rect(main_window("Cadence").rect).1 < 300
                 }
             }));
-            steps.push(wait_for(
-                "About centred over the compact window",
-                about_centred,
-            ));
+            steps.push(settle(Duration::from_millis(300)));
+            steps.push(about_stayed(&state, "the main window made compact"));
             steps.push(act({
                 let state = state.clone();
                 move || {
@@ -1982,9 +2068,10 @@ mod imp {
         }));
 
         steps.push(Step::Say(
-            "about: showing the window again (tray, second start) keeps About with it",
+            "about: showing the window again (tray, second start) keeps About where it is",
         ));
         steps.extend(open_about(a, &state, 1));
+        steps.push(record_about(&state));
         steps.push(act({
             let app = app.clone();
             move || {
@@ -1998,12 +2085,14 @@ mod imp {
             assert_eq!(about.owner, Some(main_window("Cadence").id));
             about_on_top(&about);
         }));
+        steps.push(about_stayed(&state, "the window shown again"));
         steps.extend(close_about(&state));
 
         steps.push(Step::Say(
-            "about: hidden with the main window to the tray, back with it when shown",
+            "about: hidden with the main window to the tray, back at its own position",
         ));
         steps.extend(open_about(a, &state, 1));
+        steps.extend(drag_about(&state, 40, 90));
         steps.push(act(|| {
             assert!(post_close(main_window("Cadence").id), "WM_CLOSE posted")
         }));
@@ -2019,7 +2108,8 @@ mod imp {
             let app = app.clone();
             move || app.window_visible() && about_window().is_some()
         }));
-        steps.push(wait_for("About centred again", about_centred));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(about_stayed(&state, "hidden to the tray and shown again"));
         steps.push(act({
             let state = state.clone();
             move || {
@@ -2035,7 +2125,24 @@ mod imp {
         }));
         steps.push(record_main(&state));
         steps.extend(close_about(&state));
-        // Closed by the user: it stays closed when the window comes back.
+        // Closed by the user: it stays closed when the main window moves and
+        // when it comes back from the tray.
+        steps.push(act({
+            let app = app.clone();
+            move || {
+                let r = main_window("Cadence").rect;
+                app.ui()
+                    .window()
+                    .set_position(slint::PhysicalPosition::new(r.left - 50, r.top + 30));
+            }
+        }));
+        steps.push(settle(Duration::from_millis(300)));
+        steps.push(act(|| {
+            assert!(
+                about_window().is_none(),
+                "a closed About stays closed when the main window moves"
+            )
+        }));
         steps.push(act(|| {
             assert!(post_close(main_window("Cadence").id), "WM_CLOSE posted")
         }));
