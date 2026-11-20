@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::overlay::HotkeyStatus;
 use cadence_core::config::{HotkeyAction, HotkeyBindings, ValidatedConfig};
 use cadence_core::engine::{Command, EngineHandle, ThreadExit, spawn_engine};
 use cadence_core::status::{Snapshot, StatusSlot, StatusUpdate};
@@ -23,6 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// `RegisterHotKey` fails with this when another program holds the hotkey.
+const ERROR_HOTKEY_ALREADY_REGISTERED: u32 = 1409;
 
 /// Which waiter implementation the engine uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,8 +36,10 @@ pub enum WaiterKind {
 
 /// Called (from the engine thread) when a new status snapshot is available.
 pub type WakeFn = Box<dyn Fn() + Send>;
-/// Called (from the hotkey thread) when the exit hotkey is pressed.
-pub type ExitFn = Arc<dyn Fn() + Send + Sync>;
+/// Called (from the hotkey thread) when the hotkey of an action handled by
+/// the window is pressed: [`HotkeyAction::Exit`] or [`HotkeyAction::Overlay`].
+/// Start/stop and set-target go straight to the engine.
+pub type UiHotkeyFn = Arc<dyn Fn(HotkeyAction) + Send + Sync>;
 
 /// How each thread ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,7 +84,7 @@ pub struct Runtime {
     bindings: HotkeyBindings,
     registrations: Vec<Registration>,
     status: Arc<StatusSlot>,
-    on_exit: ExitFn,
+    on_ui_hotkey: UiHotkeyFn,
     waiter: WaiterKind,
     timer_fallback: Option<Win32Error>,
 }
@@ -89,7 +94,7 @@ impl Runtime {
         config: &ValidatedConfig,
         waiter: WaiterKind,
         wake: WakeFn,
-        on_exit: ExitFn,
+        on_ui_hotkey: UiHotkeyFn,
     ) -> Result<Self, StartError> {
         let status = Arc::new(StatusSlot::new(Snapshot::new(config.click.mode())));
 
@@ -121,7 +126,7 @@ impl Runtime {
             bindings: config.hotkeys.clone(),
             registrations: Vec::new(),
             status,
-            on_exit,
+            on_ui_hotkey,
             waiter,
             timer_fallback,
         };
@@ -135,13 +140,13 @@ impl Runtime {
 
     fn hotkey_callback(&self) -> impl Fn(HotkeyEvent) + Send + 'static {
         let sender: Option<CommandSender> = self.engine.as_ref().map(EngineHandle::sender);
-        let on_exit = self.on_exit.clone();
+        let on_ui_hotkey = self.on_ui_hotkey.clone();
         move |e: HotkeyEvent| {
             let release_first = e.hotkey.modifiers;
             let command = match e.action {
                 HotkeyAction::Toggle => Command::Toggle { release_first },
                 HotkeyAction::SetTarget => Command::SetTargetFromCursor,
-                HotkeyAction::Exit => return on_exit(),
+                HotkeyAction::Exit | HotkeyAction::Overlay => return on_ui_hotkey(e.action),
             };
             if let Some(sender) = &sender {
                 let _: Result<(), EngineGone> = sender.send(command);
@@ -171,6 +176,26 @@ impl Runtime {
 
     pub fn hotkeys_active(&self) -> bool {
         self.hotkeys.is_some()
+    }
+
+    /// Whether the hotkey of `action` is registered right now.
+    pub fn hotkey_status(&self, action: HotkeyAction) -> HotkeyStatus {
+        if self.hotkeys.is_none() {
+            return HotkeyStatus::Suspended;
+        }
+        match self.registrations.iter().find(|r| r.action == action) {
+            None => HotkeyStatus::Unbound,
+            Some(Registration { result: Ok(()), .. }) => HotkeyStatus::Registered,
+            Some(Registration {
+                hotkey,
+                result: Err(e),
+                ..
+            }) => HotkeyStatus::Unavailable(if e.code == ERROR_HOTKEY_ALREADY_REGISTERED {
+                format!("another program uses {hotkey}")
+            } else {
+                format!("{hotkey} could not be registered: {e}")
+            }),
+        }
     }
 
     /// Unregisters every hotkey (while the user records a new one, so the key
@@ -299,7 +324,7 @@ mod tests {
         .hotkeys
     }
 
-    /// F13/F14 bindings, so tests never collide with a running Cadence.
+    /// F13/F14/F18 bindings, so tests never collide with a running Cadence.
     fn config(hold_ms: u32, interval_ms: u32) -> ValidatedConfig {
         let mut cfg = Config {
             click: ClickConfig {
@@ -315,6 +340,7 @@ mod tests {
         cfg.hotkeys.toggle = Some(Hotkey::plain(Key::F13));
         cfg.hotkeys.set_target = None;
         cfg.hotkeys.exit = Some(Hotkey::plain(Key::F14));
+        cfg.hotkeys.overlay = Some(Hotkey::plain(Key::F18));
         cfg.validate().unwrap()
     }
 
@@ -327,12 +353,36 @@ mod tests {
             Box::new(move || {
                 let _ = wake_tx.send("status");
             }),
-            Arc::new(move || {
-                let _ = tx.send("exit");
+            Arc::new(move |action| {
+                let _ = tx.send(match action {
+                    HotkeyAction::Exit => "exit",
+                    HotkeyAction::Overlay => "overlay",
+                    HotkeyAction::Toggle | HotkeyAction::SetTarget => "engine action",
+                });
             }),
         )
         .unwrap();
         (rt, rx)
+    }
+
+    /// Presses `vk` while a test-owned window has the foreground and returns
+    /// the first UI callback that follows (status wake-ups are skipped).
+    fn press_for_ui(rx: &mpsc::Receiver<&'static str>, vk: u16) -> Result<&'static str, String> {
+        let previous = foreground_window();
+        let m = monitors()[0];
+        let r = Rect::new(m.left + 50, m.top + 50, m.left + 250, m.top + 250);
+        let window = TestWindow::create(r, WindowKind::TopmostPopup, "runtime test").unwrap();
+        assert!(window.bring_to_foreground(), "inconclusive: no foreground");
+        send_keys(&[(vk, false), (vk, true)]);
+        let got = loop {
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok("status") => continue,
+                other => break other.map_err(|e| e.to_string()),
+            }
+        };
+        drop(window);
+        force_foreground(previous);
+        got
     }
 
     fn hotkeys_are_free(bindings: &HotkeyBindings) -> bool {
@@ -392,23 +442,50 @@ mod tests {
     fn exit_hotkey_invokes_the_exit_callback() {
         let _g = serial();
         let (mut rt, rx) = start(&config(10, 100));
-        // Inject keys only while a test-owned window has the foreground.
-        let previous = foreground_window();
-        let m = monitors()[0];
-        let r = Rect::new(m.left + 50, m.top + 50, m.left + 250, m.top + 250);
-        let window = TestWindow::create(r, WindowKind::TopmostPopup, "runtime test").unwrap();
-        assert!(window.bring_to_foreground(), "inconclusive: no foreground");
-        send_keys(&[(0x7D, false), (0x7D, true)]); // F14
-        let got = loop {
-            match rx.recv_timeout(Duration::from_secs(2)) {
-                Ok("status") => continue,
-                other => break other,
-            }
-        };
-        drop(window);
-        force_foreground(previous);
-        assert_eq!(got, Ok("exit"));
+        assert_eq!(press_for_ui(&rx, 0x7D), Ok("exit")); // F14
         assert!(rt.shutdown().unwrap().is_clean());
+    }
+
+    #[test]
+    #[ignore = "needs an interactive, unlocked Windows desktop"]
+    fn overlay_hotkey_invokes_the_ui_callback_and_its_status_is_reported() {
+        let _g = serial();
+        let cfg = config(10, 100);
+        let (mut rt, rx) = start(&cfg);
+        assert_eq!(
+            rt.hotkey_status(HotkeyAction::Overlay),
+            HotkeyStatus::Registered
+        );
+        assert_eq!(
+            rt.hotkey_status(HotkeyAction::SetTarget),
+            HotkeyStatus::Unbound
+        );
+        assert_eq!(press_for_ui(&rx, 0x81), Ok("overlay")); // F18
+
+        // While a new binding is recorded, hotkeys are paused.
+        rt.suspend_hotkeys();
+        assert_eq!(
+            rt.hotkey_status(HotkeyAction::Overlay),
+            HotkeyStatus::Suspended
+        );
+        rt.resume_hotkeys().unwrap();
+        assert_eq!(
+            rt.hotkey_status(HotkeyAction::Overlay),
+            HotkeyStatus::Registered
+        );
+        assert!(rt.shutdown().unwrap().is_clean());
+
+        // Another program holds the overlay hotkey: it is reported unavailable.
+        let taken = bindings(&[(HotkeyAction::Toggle, Key::F18)]);
+        let (other, regs) = HotkeyService::start(&taken, |_| {}).unwrap();
+        assert!(regs[0].result.is_ok());
+        let (mut rt, _rx) = start(&cfg);
+        let HotkeyStatus::Unavailable(reason) = rt.hotkey_status(HotkeyAction::Overlay) else {
+            panic!("expected Unavailable");
+        };
+        assert!(reason.contains("another program uses F18"), "{reason}");
+        assert!(rt.shutdown().unwrap().is_clean());
+        assert_eq!(other.shutdown(JOIN_TIMEOUT), ThreadExit::Clean);
     }
 
     #[test]

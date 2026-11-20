@@ -35,9 +35,11 @@ Start `cadence.exe`. The window shows the current state (Stopped / Running / Err
 
 - **Target:** choose *Fixed position* or *Current position*. *Fixed position* moves to the saved position before each click. To set it, click **Pick target**, then click anywhere on the screen: that click sets the position and is not passed on to the program underneath. Right-click (or **Cancel**) to stop picking without changing the position; there is no time limit. The set-target hotkey sets the position to the current cursor position. *Current position* clicks wherever the cursor is, without moving it; the saved position stays visible but unused, and is kept for when you switch back.
 - **Timing:** interval (start to start), interval jitter (Gaussian σ, truncated at ±3σ), hold duration, and position-jitter radius. Each setting has a short description under its name. Click the interval's unit to switch between milliseconds (`ms`) and clicks per second (`CPS`); the stored interval is always whole milliseconds, so switching never changes it. Position jitter applies to *Fixed position* mode only and is disabled otherwise. Changes apply when you press Enter, click anywhere outside the field, switch tabs or use a button. Invalid values are explained and never applied; the previous value stays active.
-- **Hotkeys:** three global hotkeys (toggle start/stop, set target, exit). Click a binding and press the new combination (Esc cancels). Function keys may be used alone; letters, digits and navigation keys need Ctrl or Alt. F12 is reserved by Windows.
+- **Hotkeys:** four global hotkeys (toggle start/stop, set target, toggle overlay, exit). Click a binding and press the new combination (Esc cancels). Function keys may be used alone; letters, digits and navigation keys need Ctrl or Alt. F12 is reserved by Windows.
+- **Compact view:** **Compact** (next to the tabs) shrinks the window to the status, the Start/Stop button and one line saying where and how often Cadence clicks; **Full view** brings back the full window at its previous size. Clicking, settings and hotkeys are not affected, and the choice is kept for the next start.
+- **Overlay mode:** **Overlay** (next to the tabs, or the tray menu) makes the window translucent and lets mouse clicks pass through it to the program underneath, while Cadence stays in front and keeps clicking. Press the overlay hotkey (F9 by default) to turn it off again: the window comes to the front, ready to use. The tray menu (**Turn off overlay**), a click on the tray icon, closing the window and starting Cadence again also end it. Overlay mode needs a working overlay hotkey, so it is not turned on while none is set or another program uses it; it is never kept for the next start. The hotkey does nothing while the window is hidden.
 - **Always on top**, **Logs** (opens the log folder), **About** and **Exit** are at the bottom of the window.
-- **Closing the window hides it** to the notification area; clicking and hotkeys keep working. The tray icon (green dot while clicking) can show/hide the window, start/stop clicking, open the logs and exit. On Windows 10 the icon may start in the overflow area (^ next to the clock); drag it to the taskbar to keep it visible.
+- **Closing the window hides it** to the notification area; clicking and hotkeys keep working. The tray icon (green dot while clicking) can show/hide the window, start/stop clicking, turn overlay mode on or off, open the logs and exit. On Windows 10 the icon may start in the overflow area (^ next to the clock); drag it to the taskbar to keep it visible.
 - **One instance:** starting Cadence again brings the running window to the front.
 
 Default settings:
@@ -50,11 +52,13 @@ Default settings:
 | Hold duration | 10 ms (0 is allowed) |
 | Position jitter | 3 px radius around the fixed position (0-50 px) |
 | Always on top | Off |
+| Layout | Full (compact view is remembered once chosen) |
 
 | Default hotkey | Action |
 |---|---|
 | F6 | Toggle start/stop |
 | F7 | Set the target to the current cursor position |
+| F9 | Toggle overlay mode (translucent, click-through window) |
 | Ctrl+Shift+F8 | Exit |
 
 **Hotkeys are global.** While the program runs, Windows does not deliver the registered key combinations to the focused application (verified on Windows 10). A combination that another program already uses is shown as unavailable, and it cannot be recorded, because Windows does not pass that key press to this program.

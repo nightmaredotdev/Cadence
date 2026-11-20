@@ -4,7 +4,9 @@
 
 #![forbid(unsafe_code)]
 
-use cadence_core::config::{ClickConfig, HotkeyAction, MAX_INTERVAL_MS, MIN_INTERVAL_MS};
+use cadence_core::config::{
+    ClickConfig, HotkeyAction, MAX_INTERVAL_MS, MIN_INTERVAL_MS, TargetMode,
+};
 use cadence_core::keys::{Hotkey, Key, Modifiers};
 use cadence_core::status::{RunState, Snapshot};
 
@@ -277,8 +279,25 @@ pub fn action_label(action: HotkeyAction) -> &'static str {
     match action {
         HotkeyAction::Toggle => "Toggle start/stop",
         HotkeyAction::SetTarget => "Set target",
+        HotkeyAction::Overlay => "Toggle overlay",
         HotkeyAction::Exit => "Exit",
     }
+}
+
+/// One line describing where and how often Cadence clicks, shown by the
+/// compact layout instead of the settings (the interval in the unit the
+/// settings use).
+pub fn summary(click: &ClickConfig, unit: IntervalUnit) -> String {
+    let place = match (click.mode, click.target) {
+        (TargetMode::Fixed, Some(p)) => format!("Fixed position {}, {}", p.x, p.y),
+        (TargetMode::Fixed, None) => "Fixed position not set".to_string(),
+        (TargetMode::Cursor, _) => "Current position".to_string(),
+    };
+    format!(
+        "{place} · {} {}",
+        format_interval(click.interval_ms, unit),
+        unit.label()
+    )
 }
 
 /// Coarse state shown in the status badge.
@@ -335,9 +354,38 @@ pub fn status_view(s: &Snapshot) -> StatusView {
 mod tests {
     use super::*;
     use cadence_core::backend::InputError;
-    use cadence_core::config::TargetMode;
     use cadence_core::geometry::Point;
     use cadence_core::status::Fault;
+
+    #[test]
+    fn the_compact_summary_names_the_position_and_the_interval() {
+        let mut click = ClickConfig::default();
+        assert_eq!(
+            summary(&click, IntervalUnit::Millis),
+            "Fixed position not set · 100 ms"
+        );
+        click.target = Some(Point::new(-640, 360));
+        assert_eq!(
+            summary(&click, IntervalUnit::Millis),
+            "Fixed position -640, 360 · 100 ms"
+        );
+        click.mode = TargetMode::Cursor;
+        click.interval_ms = 150;
+        assert_eq!(
+            summary(&click, IntervalUnit::Cps),
+            "Current position · 6.67 CPS",
+            "the same unit and rounding as the settings"
+        );
+    }
+
+    #[test]
+    fn every_hotkey_action_has_a_label() {
+        let labels: Vec<_> = HotkeyAction::ALL.iter().map(|&a| action_label(a)).collect();
+        assert_eq!(
+            labels,
+            ["Toggle start/stop", "Set target", "Toggle overlay", "Exit"]
+        );
+    }
 
     fn fields(i: &str, j: &str, h: &str, r: &str) -> TimingFields {
         TimingFields {

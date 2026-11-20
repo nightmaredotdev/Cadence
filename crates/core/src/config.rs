@@ -79,22 +79,113 @@ pub struct ClickConfig {
 #[serde(deny_unknown_fields)]
 pub struct WindowConfig {
     pub always_on_top: bool,
+    /// The compact layout (status and Start/Stop only) instead of the full
+    /// window. Written only when set, so files that do not use it keep the
+    /// layout of earlier versions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub compact: bool,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The overlay hotkey of new settings, and of settings written before
+/// overlay mode existed (unless one of their bindings already uses it).
+pub const DEFAULT_OVERLAY_HOTKEY: Hotkey = Hotkey::plain(Key::F9);
+
 /// Global hotkey bindings. `None` means unbound.
+///
+/// In the file, a missing `overlay` means [`DEFAULT_OVERLAY_HOTKEY`] unless
+/// another binding uses it, as in files from before overlay mode. So the
+/// default is not written (files that keep it stay readable by Cadence
+/// 1.1.0), and an unbound `overlay` is written as `overlay = ""`. The other
+/// bindings keep their original format (unbound = missing).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "HotkeyConfigFile")]
 pub struct HotkeyConfig {
     pub toggle: Option<Hotkey>,
     pub set_target: Option<Hotkey>,
     pub exit: Option<Hotkey>,
-    /// Separate start/stop bindings of pre-1.0 builds. Accepted when loading
-    /// older files (their values are not even parsed, so a malformed old entry
-    /// cannot break loading), never used, and dropped on the next save.
-    #[serde(default, rename = "start", skip_serializing)]
+    /// Toggles overlay mode (translucent, click-through window). It is also
+    /// the way back from overlay mode, so overlay mode needs it registered.
+    #[serde(
+        serialize_with = "serialize_overlay",
+        skip_serializing_if = "is_default_overlay"
+    )]
+    pub overlay: Option<Hotkey>,
+    /// Whether the file contained the separate start/stop bindings of pre-1.0
+    /// builds (accepted, never used, and dropped on the next save).
+    #[serde(skip)]
+    had_obsolete: bool,
+}
+
+/// The `[hotkeys]` table as it is read from a file.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HotkeyConfigFile {
+    toggle: Option<Hotkey>,
+    set_target: Option<Hotkey>,
+    exit: Option<Hotkey>,
+    /// `None` if the file predates overlay mode; `Some(None)` if unbound.
+    #[serde(default, deserialize_with = "deserialize_overlay")]
+    overlay: Option<Option<Hotkey>>,
+    /// Separate start/stop bindings of pre-1.0 builds. Their values are not
+    /// even parsed, so a malformed old entry cannot break loading.
+    #[serde(default, rename = "start")]
     obsolete_start: Option<IgnoredAny>,
-    #[serde(default, rename = "stop", skip_serializing)]
+    #[serde(default, rename = "stop")]
     obsolete_stop: Option<IgnoredAny>,
+}
+
+impl From<HotkeyConfigFile> for HotkeyConfig {
+    fn from(file: HotkeyConfigFile) -> Self {
+        let overlay = match file.overlay {
+            Some(binding) => binding,
+            // A file from before overlay mode: use the default unless that
+            // would make the settings invalid (a duplicate binding).
+            None => {
+                let taken = [file.toggle, file.set_target, file.exit]
+                    .contains(&Some(DEFAULT_OVERLAY_HOTKEY));
+                (!taken).then_some(DEFAULT_OVERLAY_HOTKEY)
+            }
+        };
+        Self {
+            toggle: file.toggle,
+            set_target: file.set_target,
+            exit: file.exit,
+            overlay,
+            had_obsolete: file.obsolete_start.is_some() || file.obsolete_stop.is_some(),
+        }
+    }
+}
+
+/// Not written: reading a missing `overlay` gives it back, because no other
+/// binding of a valid configuration can use it.
+fn is_default_overlay(overlay: &Option<Hotkey>) -> bool {
+    *overlay == Some(DEFAULT_OVERLAY_HOTKEY)
+}
+
+fn serialize_overlay<S: serde::Serializer>(
+    overlay: &Option<Hotkey>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match overlay {
+        Some(hotkey) => hotkey.serialize(serializer),
+        None => serializer.serialize_str(""),
+    }
+}
+
+fn deserialize_overlay<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<Hotkey>>, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    if text.is_empty() {
+        return Ok(Some(None));
+    }
+    text.parse()
+        .map(|hotkey| Some(Some(hotkey)))
+        .map_err(serde::de::Error::custom)
 }
 
 impl Default for Config {
@@ -134,8 +225,8 @@ impl Default for HotkeyConfig {
                 },
                 Key::F8,
             )),
-            obsolete_start: None,
-            obsolete_stop: None,
+            overlay: Some(DEFAULT_OVERLAY_HOTKEY),
+            had_obsolete: false,
         }
     }
 }
@@ -145,13 +236,16 @@ impl Default for HotkeyConfig {
 pub enum HotkeyAction {
     Toggle,
     SetTarget,
+    Overlay,
     Exit,
 }
 
 impl HotkeyAction {
-    pub const ALL: [HotkeyAction; 3] = [
+    /// Every action, in display order.
+    pub const ALL: [HotkeyAction; 4] = [
         HotkeyAction::Toggle,
         HotkeyAction::SetTarget,
+        HotkeyAction::Overlay,
         HotkeyAction::Exit,
     ];
 }
@@ -161,6 +255,7 @@ impl fmt::Display for HotkeyAction {
         f.write_str(match self {
             HotkeyAction::Toggle => "toggle",
             HotkeyAction::SetTarget => "set target",
+            HotkeyAction::Overlay => "overlay",
             HotkeyAction::Exit => "exit",
         })
     }
@@ -173,8 +268,8 @@ impl HotkeyConfig {
             toggle: None,
             set_target: None,
             exit: None,
-            obsolete_start: None,
-            obsolete_stop: None,
+            overlay: None,
+            had_obsolete: false,
         }
     }
 
@@ -182,6 +277,7 @@ impl HotkeyConfig {
         match action {
             HotkeyAction::Toggle => self.toggle,
             HotkeyAction::SetTarget => self.set_target,
+            HotkeyAction::Overlay => self.overlay,
             HotkeyAction::Exit => self.exit,
         }
     }
@@ -190,6 +286,7 @@ impl HotkeyConfig {
         let slot = match action {
             HotkeyAction::Toggle => &mut self.toggle,
             HotkeyAction::SetTarget => &mut self.set_target,
+            HotkeyAction::Overlay => &mut self.overlay,
             HotkeyAction::Exit => &mut self.exit,
         };
         *slot = hotkey;
@@ -198,13 +295,12 @@ impl HotkeyConfig {
     /// Whether the loaded file contained the obsolete separate start/stop
     /// bindings (ignored; the start/stop toggle replaces them).
     pub fn had_obsolete_bindings(&self) -> bool {
-        self.obsolete_start.is_some() || self.obsolete_stop.is_some()
+        self.had_obsolete
     }
 
     /// Forgets the obsolete bindings (they are never saved anyway).
     pub fn clear_obsolete_bindings(&mut self) {
-        self.obsolete_start = None;
-        self.obsolete_stop = None;
+        self.had_obsolete = false;
     }
 }
 
@@ -442,12 +538,19 @@ mod tests {
         let hk = |a| v.hotkeys.get(a).map(|h| h.to_string());
         assert_eq!(hk(HotkeyAction::Toggle).as_deref(), Some("F6"));
         assert_eq!(hk(HotkeyAction::SetTarget).as_deref(), Some("F7"));
+        assert_eq!(hk(HotkeyAction::Overlay).as_deref(), Some("F9"));
         assert_eq!(hk(HotkeyAction::Exit).as_deref(), Some("Ctrl+Shift+F8"));
         assert_eq!(
-            HotkeyAction::ALL.len(),
-            3,
-            "only toggle, set target and exit"
+            HotkeyAction::ALL,
+            [
+                HotkeyAction::Toggle,
+                HotkeyAction::SetTarget,
+                HotkeyAction::Overlay,
+                HotkeyAction::Exit
+            ],
+            "only toggle, set target, overlay and exit"
         );
+        assert!(!cfg.window.compact, "the full layout by default");
     }
 
     #[test]
@@ -648,6 +751,140 @@ exit = "Ctrl+Shift+F11"
         let stripped: String = plain.split("[window]").next().unwrap().to_string();
         let back: Config = toml::from_str(&stripped).unwrap();
         assert_eq!(back, Config::default());
+    }
+
+    /// A settings file as written by Cadence 1.1.0 (no overlay, no compact).
+    const FILE_1_1: &str = r#"
+version = 1
+
+[click]
+mode = "fixed"
+interval_ms = 120
+interval_jitter_sigma_ms = 10.0
+hold_ms = 10
+position_jitter_radius_px = 3
+
+[hotkeys]
+toggle = "F6"
+set_target = "F7"
+exit = "Ctrl+Shift+F8"
+
+[window]
+always_on_top = true
+"#;
+
+    #[test]
+    fn files_from_before_overlay_mode_get_the_default_overlay_hotkey() {
+        let cfg: Config = toml::from_str(FILE_1_1).expect("1.1 file loads");
+        assert_eq!(cfg.hotkeys.overlay, Some(DEFAULT_OVERLAY_HOTKEY));
+        assert!(!cfg.window.compact);
+        assert!(cfg.window.always_on_top);
+        let v = cfg.validate().expect("still valid");
+        assert_eq!(
+            v.hotkeys.get(HotkeyAction::Overlay),
+            Some(Hotkey::plain(Key::F9))
+        );
+        assert_eq!(cfg.click.interval_ms, 120, "other settings are kept");
+    }
+
+    #[test]
+    fn the_default_overlay_hotkey_never_duplicates_an_existing_binding() {
+        // A 1.1 file that already uses F9 for another action stays valid:
+        // overlay mode is simply left unbound.
+        let file = FILE_1_1.replace("toggle = \"F6\"", "toggle = \"F9\"");
+        let cfg: Config = toml::from_str(&file).unwrap();
+        assert_eq!(cfg.hotkeys.toggle, Some(Hotkey::plain(Key::F9)));
+        assert_eq!(cfg.hotkeys.overlay, None);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn an_unbound_overlay_hotkey_stays_unbound() {
+        let mut cfg = Config::default();
+        cfg.hotkeys.overlay = None;
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("overlay = \"\""), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.hotkeys.overlay, None, "not replaced by the default");
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn overlay_hotkeys_are_parsed_and_checked_like_the_others() {
+        let mut cfg = Config::default();
+        cfg.hotkeys.overlay = Some(Hotkey::new(
+            Modifiers {
+                ctrl: true,
+                alt: true,
+                shift: false,
+            },
+            Key::O,
+        ));
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("overlay = \"Ctrl+Alt+O\""), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), cfg);
+
+        let bad = text.replace("\"Ctrl+Alt+O\"", "\"Ctrl+Nope\"");
+        let err = toml::from_str::<Config>(&bad).unwrap_err().to_string();
+        assert!(err.contains("unknown key"), "{err}");
+
+        // The same rules as every binding: no duplicates, no plain letters.
+        cfg.hotkeys.overlay = Some(Hotkey::plain(Key::F6));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .0
+                .contains(&ConfigError::DuplicateHotkey {
+                    hotkey: Hotkey::plain(Key::F6),
+                    first: HotkeyAction::Toggle,
+                    second: HotkeyAction::Overlay,
+                })
+        );
+        cfg.hotkeys.overlay = Some(Hotkey::plain(Key::O));
+        assert!(matches!(
+            cfg.validate().unwrap_err().0[0],
+            ConfigError::InvalidHotkey {
+                action: HotkeyAction::Overlay,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn default_settings_keep_the_1_1_file_format() {
+        // Nothing new is written while overlay and compact keep their
+        // defaults, so Cadence 1.1.0 (strict about unknown fields) can still
+        // read the file after a downgrade.
+        let text = toml::to_string(&Config::default()).unwrap();
+        assert!(
+            !text.contains("overlay") && !text.contains("compact"),
+            "{text}"
+        );
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, Config::default());
+        assert_eq!(back.hotkeys.overlay, Some(DEFAULT_OVERLAY_HOTKEY));
+
+        // A file in exactly the 1.1 format round-trips unchanged.
+        let old: Config = toml::from_str(FILE_1_1).unwrap();
+        let rewritten = toml::to_string(&old).unwrap();
+        assert!(!rewritten.contains("overlay"), "{rewritten}");
+        assert_eq!(toml::from_str::<Config>(&rewritten).unwrap(), old);
+    }
+
+    #[test]
+    fn compact_mode_round_trips_and_is_only_written_when_on() {
+        let mut cfg = Config::default();
+        let plain = toml::to_string(&cfg).unwrap();
+        assert!(
+            !plain.contains("compact"),
+            "the full layout keeps the 1.1 [window] table: {plain}"
+        );
+        cfg.window.compact = true;
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("compact = true"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), cfg);
+        let unknown = text.replace("compact = true", "compact = true\nzoom = 2");
+        assert!(toml::from_str::<Config>(&unknown).is_err(), "still strict");
     }
 
     #[test]

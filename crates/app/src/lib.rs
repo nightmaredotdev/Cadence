@@ -12,6 +12,7 @@ pub mod form;
 pub mod gui;
 #[cfg(windows)]
 pub mod logging;
+pub mod overlay;
 #[cfg(windows)]
 pub mod runtime;
 

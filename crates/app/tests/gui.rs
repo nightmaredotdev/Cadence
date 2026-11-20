@@ -24,6 +24,7 @@ fn main() {
 mod imp {
     use cadence::config_store;
     use cadence::gui::{App, GuiOptions};
+    use cadence::overlay::OVERLAY_ALPHA;
     use cadence::runtime::{JOIN_TIMEOUT, WaiterKind};
     use cadence::ui::RunStatus;
     use cadence_core::backend::InputBackend;
@@ -37,7 +38,7 @@ mod imp {
         monitors, post_close, send_keys, window_at, windows_of_process,
     };
     use cadence_platform::{HotkeyService, WindowsInput};
-    use slint::{Model, Timer, TimerMode};
+    use slint::{ComponentHandle, Model, Timer, TimerMode};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -60,6 +61,7 @@ mod imp {
     const VK_F13: u16 = 0x7C;
     const VK_F16: u16 = 0x7F;
     const VK_F17: u16 = 0x80;
+    const VK_F18: u16 = 0x81;
 
     /// Runs the Slint event loop for `duration`.
     fn pump(duration: Duration) {
@@ -241,6 +243,8 @@ mod imp {
 
         first_session(&path, &recorder);
         second_session(&path);
+        compact_and_overlay_session(&dir, &recorder);
+        overlay_needs_an_available_hotkey(&dir);
         startup_conflict_is_shown(&dir);
         obsolete_start_stop_bindings_are_migrated(&dir);
         corrupt_settings_are_reported(&dir);
@@ -905,13 +909,16 @@ mod imp {
                 .to_string()
         };
 
-        step("only the three hotkey actions are offered");
+        step("only the four hotkey actions are offered");
         let labels: Vec<String> = ui
             .get_hotkeys()
             .iter()
             .map(|r| r.label.to_string())
             .collect();
-        assert_eq!(labels, ["Toggle start/stop", "Set target", "Exit"]);
+        assert_eq!(
+            labels,
+            ["Toggle start/stop", "Set target", "Toggle overlay", "Exit"]
+        );
 
         step("record a Ctrl+Shift+letter hotkey by pressing it");
         focus(gui);
@@ -1158,11 +1165,334 @@ mod imp {
         assert_ne!(ui.get_target_text(), "Not set");
         assert_eq!(app.snapshot().target, app.config().click.target);
         let rows = ui.get_hotkeys();
-        assert_eq!(rows.row_count(), 3);
-        assert_eq!(rows.row_data(2).unwrap().binding, "Ctrl+Shift+K", "exit");
+        assert_eq!(rows.row_count(), 4);
+        assert_eq!(rows.row_data(3).unwrap().binding, "Ctrl+Shift+K", "exit");
+        assert_eq!(rows.row_data(2).unwrap().binding, "Not set", "overlay");
         assert_eq!(rows.row_data(1).unwrap().binding, "Not set", "set target");
         assert!(app.close().unwrap().is_clean());
         drop(app);
+    }
+
+    fn hotkey_index(action: HotkeyAction) -> i32 {
+        HotkeyAction::ALL.iter().position(|a| *a == action).unwrap() as i32
+    }
+
+    /// The middle of the main window's client area.
+    fn center_of(window: cadence_platform::diagnostics::WindowId) -> Point {
+        let r = client_rect(window).expect("client area");
+        Point::new((r.left + r.right) / 2, (r.top + r.bottom) / 2)
+    }
+
+    fn size_of(r: Rect) -> (i32, i32) {
+        (r.right - r.left, r.bottom - r.top)
+    }
+
+    /// Asserts that overlay mode is active, verified natively.
+    fn assert_overlay_on(app: &App) {
+        assert!(app.overlay_active());
+        assert!(app.ui().get_overlay_active(), "the window shows it");
+        assert!(
+            app.tray().unwrap().get_overlay_active(),
+            "the tray shows it"
+        );
+        let s = app.native_overlay_styles().expect("native state");
+        assert!(s.click_through && s.layered, "{s:?}");
+        assert_eq!(s.alpha, Some(OVERLAY_ALPHA), "{s:?}");
+    }
+
+    /// Asserts that the window is back to normal, verified natively.
+    fn assert_overlay_off(app: &App) {
+        assert!(!app.overlay_active());
+        assert!(!app.ui().get_overlay_active());
+        assert!(!app.tray().unwrap().get_overlay_active());
+        let s = app.native_overlay_styles().expect("native state");
+        assert!(s.is_normal(), "{s:?}");
+    }
+
+    /// Overlay mode is off for a hidden window. Between test steps Slint may
+    /// drop a hidden window's native window (see the tray step below); a
+    /// window that does not exist cannot be click-through either.
+    fn assert_overlay_off_while_hidden(app: &App) {
+        assert!(!app.overlay_active());
+        assert!(!app.ui().get_overlay_active());
+        assert!(!app.tray().unwrap().get_overlay_active());
+        if let Ok(s) = app.native_overlay_styles() {
+            assert!(s.is_normal(), "{s:?}");
+        }
+    }
+
+    fn compact_and_overlay_session(dir: &Path, recorder: &MouseHookRecorder) {
+        let path = dir.join("overlay.toml");
+        let mut cfg = initial_config();
+        cfg.click.mode = TargetMode::Cursor;
+        cfg.hotkeys.overlay = Some(Hotkey::plain(Key::F18));
+        config_store::save(&path, &cfg).unwrap();
+
+        step("compact layout: launch in the full layout");
+        let app = App::new(options(&path)).expect("app starts");
+        let ui = app.ui();
+        let tray = app.tray().expect("notification-area icon");
+        app.show_window();
+        pump(Duration::from_millis(500));
+        let gui = main_window("Cadence").id;
+        assert!(!ui.get_compact_mode());
+        assert_eq!(ui.get_overlay_key(), "F18", "shown on the Overlay button");
+        let full = size_of(client_rect(gui).unwrap());
+        assert_overlay_off(&app);
+
+        step("compact layout: a small window with status, Start/Stop and a summary");
+        ui.invoke_compact_toggled();
+        pump_until("compact window", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()).1 < full.1 / 2
+        });
+        pump(Duration::from_millis(200));
+        let compact = size_of(client_rect(gui).unwrap());
+        assert!(ui.get_compact_mode());
+        assert!(compact.0 < full.0, "narrower: {compact:?} vs {full:?}");
+        assert_eq!(
+            compact.1 as f32,
+            (ui.get_layout_preferred_height() * ui.window().scale_factor()).round(),
+            "exactly as tall as the compact layout"
+        );
+        assert_eq!(ui.get_summary_text(), "Current position · 100 ms");
+        assert_eq!(ui.get_toggle_key(), "F13", "Start/Stop shows its hotkey");
+        assert!(saved(&path).window.compact, "the layout is saved");
+
+        step("compact layout: switching while clicking keeps clicking and the settings");
+        let settings = app.config();
+        recorder.clear();
+        ui.invoke_start_stop_clicked();
+        pump_until("clicks", Duration::from_secs(5), || {
+            downs(&recorder.events()) >= 3
+        });
+        let clicks = app.snapshot().run_clicks;
+        ui.invoke_compact_toggled();
+        pump_until("full window", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == full
+        });
+        assert!(!ui.get_compact_mode());
+        assert!(!saved(&path).window.compact);
+        let before = downs(&recorder.events());
+        pump(Duration::from_millis(400));
+        assert!(downs(&recorder.events()) > before, "still clicking");
+        assert_eq!(ui.get_status(), RunStatus::Running);
+        assert!(
+            app.snapshot().run_clicks > clicks,
+            "the same run continues (not restarted)"
+        );
+        assert_eq!(
+            app.config().click,
+            settings.click,
+            "click settings unchanged"
+        );
+        assert_eq!(app.config().hotkeys, settings.hotkeys, "hotkeys unchanged");
+        assert_eq!(ui.get_interval_text(), "100", "fields kept");
+        assert_eq!(ui.get_hotkeys().row_count(), 4);
+
+        step("overlay: translucent, click-through and in front; clicking goes on");
+        ui.invoke_compact_toggled();
+        pump_until("compact again", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == compact
+        });
+        assert!(!main_window("Cadence").topmost);
+        ui.invoke_overlay_clicked();
+        assert_overlay_on(&app);
+        pump_until("always on top", Duration::from_secs(2), || {
+            main_window("Cadence").topmost
+        });
+        pump(Duration::from_millis(300));
+        // Making it topmost rewrites the window styles: still an overlay.
+        assert_overlay_on(&app);
+        assert_eq!(
+            size_of(client_rect(gui).unwrap()),
+            compact,
+            "overlay mode keeps the window size"
+        );
+        let center = center_of(gui);
+        assert_ne!(
+            window_at(center),
+            gui,
+            "the mouse passes through the window"
+        );
+        assert!(!app.config().window.always_on_top, "the setting is kept");
+        let before = downs(&recorder.events());
+        pump(Duration::from_millis(400));
+        assert!(downs(&recorder.events()) > before, "still clicking");
+
+        step("overlay: the hotkey ends it while another program has the focus");
+        let m = monitors()[0];
+        let r = Rect::new(m.right - 260, m.bottom - 260, m.right - 60, m.bottom - 60);
+        let other = TestWindow::create(r, WindowKind::TopmostPopup, "overlay keys").unwrap();
+        focus(other.id());
+        press(other.id(), &tap(VK_F18));
+        pump_until("overlay off by hotkey", Duration::from_secs(3), || {
+            !app.overlay_active()
+        });
+        assert_overlay_off(&app);
+        pump_until("brought to the front", Duration::from_secs(2), || {
+            foreground_window() == gui
+        });
+        pump_until("not on top any more", Duration::from_secs(2), || {
+            !main_window("Cadence").topmost
+        });
+        assert_eq!(ui.get_status(), RunStatus::Running, "clicking goes on");
+
+        step("overlay: the hotkey turns it on without taking the focus");
+        focus(other.id());
+        press(other.id(), &tap(VK_F18));
+        pump_until("overlay on by hotkey", Duration::from_secs(3), || {
+            app.overlay_active()
+        });
+        assert_overlay_on(&app);
+        pump(Duration::from_millis(300));
+        assert_eq!(
+            foreground_window(),
+            other.id(),
+            "the program in use keeps the focus"
+        );
+
+        step("overlay: the keyboard cannot pause or clear its hotkey");
+        ui.invoke_start_recording(hotkey_index(HotkeyAction::Overlay));
+        pump(Duration::from_millis(100));
+        assert_eq!(ui.get_capturing_index(), -1, "recording refused");
+        assert!(app.hotkeys_active());
+        ui.invoke_hotkey_clear(hotkey_index(HotkeyAction::Overlay));
+        assert_eq!(app.config().hotkeys.overlay, Some(Hotkey::plain(Key::F18)));
+        assert_overlay_on(&app);
+
+        step("overlay: the tray turns it off and on");
+        tray.invoke_toggle_overlay();
+        assert_overlay_off(&app);
+        tray.invoke_toggle_overlay();
+        assert_overlay_on(&app);
+
+        step("overlay: stopping and starting clicking from the tray keeps it on");
+        tray.invoke_start_stop();
+        pump_until("stopped", Duration::from_secs(2), || {
+            ui.get_status() == RunStatus::Stopped
+        });
+        assert_overlay_on(&app);
+        recorder.clear();
+        tray.invoke_start_stop();
+        pump_until("clicking again", Duration::from_secs(5), || {
+            downs(&recorder.events()) >= 2
+        });
+        assert_overlay_on(&app);
+
+        step("overlay: closing the window ends it; the hotkey does nothing while hidden");
+        assert!(post_close(gui), "WM_CLOSE posted");
+        pump_until("hidden", Duration::from_secs(2), || !app.window_visible());
+        assert_overlay_off_while_hidden(&app);
+        focus(other.id());
+        press(other.id(), &tap(VK_F18));
+        pump(Duration::from_millis(500));
+        assert!(!app.window_visible(), "not shown by the hotkey");
+        assert_overlay_off_while_hidden(&app);
+        assert_eq!(foreground_window(), other.id(), "focus not taken");
+
+        step("overlay: the tray item shows the window; the icon ends overlay mode");
+        // In the application the hidden window keeps its native window, so
+        // the tray item turns overlay mode on at once. This test leaves the
+        // event loop between steps, and Slint then drops the native window of
+        // a hidden window, which comes back only once the loop runs again. So
+        // here the item shows the window (and reports, safely, that overlay
+        // mode could not be turned on yet); it is then turned on from the
+        // tray as usual.
+        tray.invoke_toggle_overlay();
+        pump_until("shown", Duration::from_secs(3), || {
+            app.window_visible() && app.native_overlay_styles().is_ok()
+        });
+        if !app.overlay_active() {
+            assert_overlay_off(&app);
+            tray.invoke_toggle_overlay();
+        }
+        assert_overlay_on(&app);
+        tray.invoke_show_window(); // left click on the icon
+        pump_until("normal window", Duration::from_secs(2), || {
+            !app.overlay_active()
+        });
+        assert_overlay_off(&app);
+        assert!(app.window_visible());
+        assert!(ui.get_compact_mode(), "still compact");
+        drop(other);
+
+        step("overlay: exiting while it is on shuts down cleanly");
+        ui.invoke_overlay_clicked();
+        assert_overlay_on(&app);
+        tray.invoke_exit();
+        let report = app.shutdown_report().expect("shut down");
+        assert!(report.is_clean(), "{report:?}");
+        assert!(!app.overlay_active());
+        pump(Duration::from_millis(300));
+        let count = recorder.events().len();
+        pump(Duration::from_millis(300));
+        assert_eq!(recorder.events().len(), count, "no clicks after exit");
+        assert_paired(&recorder.events());
+        drop(app);
+
+        step("compact layout: restored at the next start");
+        let app = App::new(options(&path)).expect("app restarts");
+        app.show_window();
+        pump(Duration::from_millis(500));
+        assert!(app.ui().get_compact_mode());
+        let gui = main_window("Cadence").id;
+        assert_eq!(size_of(client_rect(gui).unwrap()), compact);
+        assert_overlay_off(&app);
+
+        step("compact layout: the full layout opens at its usual size");
+        app.ui().invoke_compact_toggled();
+        pump_until("full window", Duration::from_secs(3), || {
+            size_of(client_rect(gui).unwrap()) == full
+        });
+        assert!(app.close().unwrap().is_clean());
+        drop(app);
+        recorder.clear();
+    }
+
+    fn overlay_needs_an_available_hotkey(dir: &Path) {
+        step("overlay: refused without an overlay hotkey");
+        let path = dir.join("no-overlay-key.toml");
+        config_store::save(&path, &initial_config()).unwrap();
+        let app = App::new(options(&path)).expect("app starts");
+        app.show_window();
+        pump(Duration::from_millis(300));
+        assert_eq!(app.config().hotkeys.overlay, None);
+        assert_eq!(app.ui().get_overlay_key(), "");
+        app.ui().invoke_overlay_clicked();
+        assert_overlay_off(&app);
+        assert!(
+            app.ui()
+                .get_notice_text()
+                .contains("Set one on the Hotkeys tab"),
+            "{}",
+            app.ui().get_notice_text()
+        );
+        app.tray().unwrap().invoke_toggle_overlay();
+        assert_overlay_off(&app);
+        assert!(app.close().unwrap().is_clean());
+        drop(app);
+
+        step("overlay: refused while another program holds its hotkey");
+        let path = dir.join("taken-overlay-key.toml");
+        let mut cfg = initial_config();
+        cfg.hotkeys.overlay = Some(Hotkey::plain(Key::F18));
+        config_store::save(&path, &cfg).unwrap();
+        let other = hold_hotkey(Key::F18);
+        let app = App::new(options(&path)).expect("app starts");
+        app.show_window();
+        pump(Duration::from_millis(300));
+        let row = app
+            .ui()
+            .get_hotkeys()
+            .row_data(hotkey_index(HotkeyAction::Overlay) as usize)
+            .unwrap();
+        assert!(row.problem.contains("another program"), "{}", row.problem);
+        app.ui().invoke_overlay_clicked();
+        assert_overlay_off(&app);
+        let notice = app.ui().get_notice_text().to_string();
+        assert!(notice.contains("another program uses F18"), "{notice}");
+        assert!(app.close().unwrap().is_clean());
+        assert_eq!(other.shutdown(JOIN_TIMEOUT), ThreadExit::Clean);
     }
 
     fn startup_conflict_is_shown(dir: &Path) {
@@ -1205,7 +1535,7 @@ mod imp {
         assert!(warning.contains("no longer supported"), "{warning}");
         assert_eq!(app.config().click.interval_ms, 333, "other settings kept");
         assert_eq!(app.config().hotkeys.toggle, Some(Hotkey::plain(Key::F13)));
-        assert_eq!(app.ui().get_hotkeys().row_count(), 3);
+        assert_eq!(app.ui().get_hotkeys().row_count(), 4);
         let migrated = std::fs::read_to_string(&path).unwrap();
         assert!(
             !migrated.contains("start =") && !migrated.contains("stop ="),

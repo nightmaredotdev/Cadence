@@ -12,6 +12,7 @@ mod input;
 mod instance;
 mod keys;
 mod message;
+mod overlay;
 mod picker;
 mod waiter;
 
@@ -32,5 +33,6 @@ pub use instance::{
 };
 pub use keys::virtual_key;
 pub use message::show_error_message;
+pub use overlay::{OverlayStyles, set_window_opacity, window_overlay_styles};
 pub use picker::{PickOutcome, PointPicker};
 pub use waiter::HighResWaiter;
