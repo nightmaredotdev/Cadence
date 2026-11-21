@@ -774,7 +774,15 @@ pub fn capture_screen(rect: Rect) -> Option<Vec<[u8; 3]>> {
     unsafe { DeleteDC(memory) };
     // SAFETY: obtained with GetDC above.
     unsafe { ReleaseDC(std::ptr::null_mut(), screen) };
-    (copied && rows == height).then(|| bgra.chunks_exact(4).map(|p| [p[2], p[1], p[0]]).collect())
+    (copied && rows == height).then(|| bgra_to_rgb(&bgra))
+}
+
+/// RGB pixels from the 32-bit pixels `GetDIBits` writes (blue, green, red,
+/// unused). Bytes after the last whole pixel are ignored; the capture buffer
+/// always holds whole pixels.
+fn bgra_to_rgb(bgra: &[u8]) -> Vec<[u8; 3]> {
+    let (pixels, _partial) = bgra.as_chunks::<4>();
+    pixels.iter().map(|&[b, g, r, _]| [r, g, b]).collect()
 }
 
 /// An uncompressed 24-bit BMP file of RGB `pixels` (row by row, top down),
@@ -1054,4 +1062,21 @@ pub fn cursor_position() -> Point {
     // SAFETY: valid, writable POINT.
     unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p) };
     Point::new(p.x, p.y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captured_bgra_pixels_become_rgb() {
+        assert_eq!(
+            bgra_to_rgb(&[1, 2, 3, 255, 10, 20, 30, 0]),
+            vec![[3, 2, 1], [30, 20, 10]]
+        );
+        assert!(bgra_to_rgb(&[]).is_empty());
+        // An incomplete pixel at the end is ignored.
+        assert_eq!(bgra_to_rgb(&[1, 2, 3, 4, 5, 6, 7]), vec![[3, 2, 1]]);
+        assert!(bgra_to_rgb(&[1, 2, 3]).is_empty());
+    }
 }
