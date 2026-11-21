@@ -27,10 +27,11 @@ focused program. All hotkeys can be changed on the Hotkeys tab.
 
 Compact view and overlay mode
 -----------------------------
-"Compact" (next to the tabs) shrinks the window to the status, the
-Start/Stop button and a line saying where and how often Cadence clicks.
-"Full view" brings back the full window. Clicking and settings are not
-affected, and the choice is kept for the next start.
+"Compact" (under the status) shrinks the window to the status panel: the
+state, the Start/Stop button and the Overlay and Full view buttons.
+"Full view" brings back the full window, moved up if needed to fit on the
+screen. Clicking and settings are not affected, and the choice is kept for
+the next start. Notices are shown in the full view only.
 
 "Overlay" makes the window translucent and lets mouse clicks pass through
 it to the program underneath, while Cadence stays in front and keeps
